@@ -1,0 +1,61 @@
+# ── R / RStudio ─────────────────────────────────────────────────────────────
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+*.Rout
+
+# ── Credenciais e variáveis de ambiente ──────────────────────────────────────
+.env
+.env.*
+.Renviron.local
+secrets.yaml
+secrets.yml
+*_credentials*.json
+*_key*.json
+api_keys.R
+api_keys.yaml
+
+# ── Dados brutos e processados ───────────────────────────────────────────────
+# Arquivos coletados de APIs (BCB, FRED, Yahoo, IBGE, B3, etc.)
+# Usar .gitkeep para preservar a estrutura de pastas
+data/raw/
+data/processed/
+data/cache/
+data/external/
+
+# ── Modelos serializados ─────────────────────────────────────────────────────
+models/
+mlruns/
+
+# ── Outputs / Relatórios renderizados ────────────────────────────────────────
+output/
+*_files/
+_site/
+_book/
+_freeze/
+
+# ── Logs e temporários ───────────────────────────────────────────────────────
+*.log
+tmp/
+temp/
+.cache/
+
+# ── macOS ─────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+
+# ── VS Code ──────────────────────────────────────────────────────────────────
+.vscode/
+
+# ── renv / packrat ────────────────────────────────────────────────────────────
+renv/library/
+renv/.gitignore
+packrat/lib/
+packrat/lib-ext/
+packrat/lib-R/
+packrat/src/
+
+# ── Claude Code (sessão e memória; skills ficam versionadas) ─────────────────
+.claude/projects/
+.claude/todos/
