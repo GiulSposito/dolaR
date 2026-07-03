@@ -1,0 +1,36 @@
+══════════════════════════════════════════════════════════
+  Hyperparameter Tuning dolaR — Resumo
+══════════════════════════════════════════════════════════
+  Train+Val    : 3242 obs
+  CV strategy  : sliding_window (39 folds)
+  Grid         : Latin Hypercube, 30 configurações por modelo
+
+  Melhoria pós-tuning:
+  # A tibble: 6 × 6
+    horizonte  modelo rmse_tuned rmse_tuned_se rmse_baseline melhora_pct
+    <chr>      <chr>       <dbl>         <dbl>         <dbl>       <dbl>
+  1 target_5d  enet       0.0209       0.00107            NA          NA
+  2 target_5d  rf         0.0224       0.00123            NA          NA
+  3 target_30d rf         0.0497       0.00457            NA          NA
+  4 target_30d xgb        0.0497       0.00475            NA          NA
+  5 target_90d rf         0.0690       0.00616            NA          NA
+  6 target_90d xgb        0.0688       0.00648            NA          NA
+
+  Champions (melhor modelo tunado por horizonte):
+  # A tibble: 3 × 3
+    horizonte  champion rmse_cv
+    <chr>      <chr>      <dbl>
+  1 target_5d  enet      0.0209
+  2 target_30d rf        0.0497
+  3 target_90d xgb       0.0688
+
+  Arquivos gerados:
+  - models/tuned/champion-target_*.rds   (fit final em train_val)
+  - models/tuned/champion-wf-target_*.rds
+  - outputs/tables/tuning-results.csv
+  - outputs/figures/tuning-comparison.png
+
+  ARIMA D+5 benchmark: 0.01570 (referência)
+
+  Próximo passo: scripts/13-evaluation.R
+══════════════════════════════════════════════════════════

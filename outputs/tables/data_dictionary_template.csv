@@ -1,0 +1,23 @@
+variavel,fonte,grupo,tipo,descricao,frequencia,disponibilidade,role,keep,notas
+date,BCB PTAX,temporal,Date,Data da observação,diária,t,id,TRUE,Dias úteis com PTAX disponível
+usd_brl_ptax,BCB PTAX,cambio,numeric,USD/BRL cotação venda (PTAX oficial),diária,t,outcome+feature,TRUE,Variável-alvo principal
+usd_brl,Yahoo Finance,cambio,numeric,USD/BRL mercado (ajustado),diária,t,feature,TRUE,Alternativa ao PTAX
+dxy,Yahoo Finance,cambio,numeric,Índice do dólar (DXY),diária,t,feature,TRUE,Força global do dólar
+vix,FRED/Yahoo,risco,numeric,CBOE VIX — volatilidade implícita S&P 500,diária,t,feature,TRUE,Aversão a risco global
+sp500,Yahoo Finance,bolsa,numeric,S&P 500 (ajustado),diária,t,feature,TRUE,Apetite a risco global
+ibovespa,Yahoo Finance,bolsa,numeric,Ibovespa (ajustado),diária,t,feature,TRUE,Apetite a risco local
+ewz,Yahoo Finance,brasil,numeric,ETF iShares Brazil (EWZ) — proxy risco Brasil,diária,t,feature,TRUE,Proxy de CDS Brasil
+petroleo_brent,Yahoo Finance,commodities,numeric,Petróleo Brent (USD/barril),diária,t,feature,TRUE,Termos de troca Brasil
+petroleo_wti,Yahoo Finance,commodities,numeric,Petróleo WTI (USD/barril),diária,t,feature,TRUE,Alternativa ao Brent
+cobre,Yahoo Finance,commodities,numeric,Cobre (USD/libra) — proxy ciclo global,diária,t,feature,TRUE,Correlacionado com China
+selic_meta,BCB SGS 432,juros_br,numeric,Meta Selic (% a.a.),diária,t,feature,TRUE,Diferencial de juros BR-EUA
+selic_diaria,BCB SGS 11,juros_br,numeric,Taxa Selic diária acumulada,diária,t,feature,TRUE,
+ipca_mensal,BCB SGS 433,inflacao_br,numeric,IPCA variação mensal (%),mensal,t+15,feature,TRUE,Forward-fill até próxima divulgação
+treasury_2y,FRED DGS2,juros_us,numeric,Treasury yield 2 anos (%),diária,t,feature,TRUE,Diferencial de juros curto
+treasury_10y,FRED DGS10,juros_us,numeric,Treasury yield 10 anos (%),diária,t,feature,TRUE,Diferencial de juros longo
+fed_funds,FRED FEDFUNDS,juros_us,numeric,Fed Funds Rate (%),mensal,t+30,feature,TRUE,Forward-fill
+cpi_us,FRED CPIAUCSL,inflacao_us,numeric,CPI EUA (nível),mensal,t+30,feature,TRUE,Divulgado ~15 dias após mês de referência
+desemprego_us,FRED UNRATE,atividade_us,numeric,Taxa desemprego EUA (%),mensal,t+7,feature,TRUE,Divulgado 1a sexta do mês
+target_5d,calculado,target,numeric,Retorno log USD/BRL em 5 dias úteis,diária,t+5,outcome,TRUE,= log(usd_brl[t+5] / usd_brl[t])
+target_30d,calculado,target,numeric,Retorno log USD/BRL em 30 dias úteis,diária,t+30,outcome,TRUE,= log(usd_brl[t+30] / usd_brl[t])
+target_90d,calculado,target,numeric,Retorno log USD/BRL em 90 dias úteis,diária,t+90,outcome,TRUE,= log(usd_brl[t+90] / usd_brl[t])

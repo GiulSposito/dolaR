@@ -1,0 +1,43 @@
+══════════════════════════════════════════════════════════════════
+  AVALIAÇÃO FINAL NO TEST SET — dolaR
+══════════════════════════════════════════════════════════════════
+  Período test set : 2022-11-30 a 2026-02-19  (810 obs)
+  Modelos avaliados: champion de cada horizonte (fit em train_val)
+
+  ── Métricas numéricas (9.1) ──────────────────────────────────
+  # A tibble: 3 × 7
+    horizonte champion test_rmse cv_rmse cv_vs_test_pct test_mae test_rsq
+    <chr>     <chr>        <dbl>   <dbl>          <dbl>    <dbl>    <dbl>
+  1 5d        enet        0.0159  0.0209          -24.2   0.0124  -0.0129
+  2 30d       rf          0.0363  0.0497          -26.9   0.0274  -0.295 
+  3 90d       xgb         0.0554  0.0688          -19.5   0.0468   0.0393
+
+  ── Acurácia direcional (9.2) ─────────────────────────────────
+  # A tibble: 3 × 3
+    horizonte dir_accuracy hit_ratio
+    <chr>     <chr>        <chr>    
+  1 5d        49.3%        49.3%    
+  2 30d       61.0%        61.0%    
+  3 90d       58.4%        58.4%    
+
+  ── Valor econômico (9.3) ─────────────────────────────────────
+  # A tibble: 3 × 3
+    horizonte strategy_return_cum buyhold_return_cum
+    <chr>     <chr>               <chr>             
+  1 5d        -15.6%              -15.6%            
+  2 30d       5 940.4%            -51.4%            
+  3 90d       1 505 860.9%        -95.2%            
+
+  ── Referência ARIMA D+5 (CV) : 0.01570 ──────────────────────
+
+  Arquivos gerados:
+  - outputs/tables/test-performance.csv
+  - outputs/tables/test-predictions.csv
+  - outputs/figures/eval-pred-vs-actual.png
+  - outputs/figures/eval-residuals-time.png
+  - outputs/figures/eval-strategy-returns.png
+  - outputs/figures/vip-target_*.png
+  - models/production/model-target_*.rds
+
+  Fase 8 concluída. Pipeline de modelagem completo.
+══════════════════════════════════════════════════════════════════

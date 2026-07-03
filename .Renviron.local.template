@@ -1,0 +1,18 @@
+# Template de variáveis de ambiente para o projeto dolaR
+# Copie este arquivo para .Renviron.local e preencha com seus valores reais.
+# O .Renviron.local está no .gitignore — nunca commitar chaves reais.
+#
+# Após criar o arquivo, reinicie o R (Session > Restart R no RStudio).
+
+# ── FRED (Federal Reserve Economic Data) ─────────────────────────────────────
+# Chave gratuita em: https://fred.stlouisfed.org/docs/api/api_key.html
+FRED_API_KEY=sua_chave_fred_aqui
+
+# ── EIA (Energy Information Administration) — fase futura ────────────────────
+# Chave gratuita em: https://www.eia.gov/opendata/register.php
+EIA_API_KEY=sua_chave_eia_aqui
+
+# ── ANBIMA — fase futura ─────────────────────────────────────────────────────
+# Cadastro em: https://developers.anbima.com.br
+ANBIMA_CLIENT_ID=seu_client_id_aqui
+ANBIMA_CLIENT_SECRET=seu_client_secret_aqui

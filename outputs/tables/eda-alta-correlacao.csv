@@ -1,0 +1,12 @@
+var1,var2,cor
+petroleo_brent,petroleo_wti,0.9944628545059273
+nasdaq,sp500,0.992661277140784
+ouro,sp500,0.8973916870268823
+nasdaq,ouro,0.8906553273231399
+ouro,sofr,-0.8856300926215428
+cdi_diario,sofr,-0.8792028316425409
+petroleo_brent,treasury_2y,0.8767055435938598
+cdi_diario,ouro,0.8728836650052745
+petroleo_wti,treasury_2y,0.8665510801604858
+ouro,petroleo_brent,-0.8631667355882364
+ouro,petroleo_wti,-0.8553806430062362

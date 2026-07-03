@@ -1,0 +1,14 @@
+══════════════════════════════════════════════════════════
+  EDA dolaR — Resumo
+══════════════════════════════════════════════════════════
+  Dataset: 4052 obs x 60 vars (2010-01-04 a 2026-02-19)
+  Variáveis com >10% missing: 16
+  Pares com alta correlação (>0.85): 11
+
+  Recomendações:
+  1. Remover saldo_cambial (0 obs úteis)
+  2. us_hy_spread: só desde 2023-07 (< 3 anos)
+  3. pim_geral: forward-fill com gap de 4 anos
+  4. sofr: NA antes de 2018-04
+  5. Próximo passo: 10-feature-engineering.R
+══════════════════════════════════════════════════════════

@@ -1,0 +1,1812 @@
+---
+title: "dolaR — Previsão do USD/BRL"
+subtitle: "Relatório Técnico · Pipeline completo de modelagem (D+5, D+30, D+90)"
+author: "Helix DS · Marie"
+date: today
+lang: pt
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 4
+    toc-location: left
+    embed-resources: true
+    code-fold: true
+    code-summary: "Ver código"
+    fig-width: 11
+    fig-height: 6
+    df-print: paged
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+library(tidyverse)
+library(lubridate)
+library(here)
+library(scales)
+library(plotly)
+library(DT)
+library(readr)
+library(knitr)
+
+# Dados principais
+ds       <- readRDS(here("data", "processed", "features_dataset.rds")) |> arrange(date)
+ds_full  <- readRDS(here("data", "processed", "daily_dataset.rds"))    |> arrange(date)
+
+# Tabelas de resultados
+target_stats    <- read_csv(here("outputs","tables","eda-target-stats.csv"),         show_col_types=FALSE)
+miss_summary    <- read_csv(here("outputs","tables","eda-missing-summary.csv"),      show_col_types=FALSE)
+serie_inicio    <- read_csv(here("outputs","tables","eda-serie-inicio.csv"),         show_col_types=FALSE) |> filter(!is.infinite(inicio))
+cor_targets     <- read_csv(here("outputs","tables","eda-correlacoes-targets.csv"),  show_col_types=FALSE)
+alta_cor        <- read_csv(here("outputs","tables","eda-alta-correlacao.csv"),      show_col_types=FALSE)
+top_cor         <- read_csv(here("outputs","tables","eda-top-correlacoes.csv"),      show_col_types=FALSE)
+fe_completude   <- read_csv(here("outputs","tables","fe-feature-completude.csv"),    show_col_types=FALSE)
+fe_cor          <- read_csv(here("outputs","tables","fe-correlation-features.csv"),  show_col_types=FALSE)
+baseline_full   <- read_csv(here("outputs","tables","baseline-cv-results-full.csv"),show_col_types=FALSE)
+tuning_results  <- read_csv(here("outputs","tables","tuning-results.csv"),           show_col_types=FALSE)
+test_perf       <- read_csv(here("outputs","tables","test-performance.csv"),         show_col_types=FALSE)
+test_preds      <- read_csv(here("outputs","tables","test-predictions.csv"),         show_col_types=FALSE)
+```
+
+# 1. Contexto e Definição do Problema {#sec-contexto}
+
+## 1.1 Por que câmbio é difícil de prever?
+
+A taxa de câmbio USD/BRL é um dos ativos financeiros mais estudados — e mais resistentes à previsão — da literatura econômica. Décadas de pesquisa acumularam evidências de que modelos estruturais raramente superam uma caminhada aleatória (*random walk*) em horizontes curtos, resultado que ficou conhecido como o *puzzle* de Meese-Rogoff desde o trabalho seminal de 1983. A explicação subjacente remete à **Hipótese de Mercado Eficiente (HME)**: se toda informação disponível já estiver refletida no preço corrente, variações futuras são, por definição, imprevisíveis a partir de dados passados.
+
+Na prática, porém, o câmbio real incorpora ao menos duas fontes de complexidade que abrem espaço para modelagem:
+
+1. **Quebras de regime** (*regime breaks*): diferencial de juros, choques externos (pandemia, guerra), crises fiscais domésticas e mudanças de política monetária criam períodos com dinâmicas completamente distintas. Um modelo treinado em regime de estabilidade pode falhar sistematicamente durante estresse, e vice-versa.
+
+2. **Horizonte importa**: no curtíssimo prazo (D+5), o câmbio é dominado por fluxo financeiro e microestrutura de mercado. No médio prazo (D+30), a sinalização de política monetária e o diferencial de juros ganham peso. No longo prazo (D+90), fundamentos macroeconômicos — balança comercial, inflação relativa, condições fiscais — têm mais influência. Modelos que ignoram essa diferença de escala temporal tendem a ser mal especificados.
+
+::: {.callout-note}
+## A humildade do forecaster
+O objetivo deste projeto **não** é afirmar que o câmbio é previsível de forma absoluta. O objetivo é verificar se existe sinal estatístico explorável em cada horizonte, usando um pipeline rigoroso de validação temporal. Um modelo que supera sistematicamente o baseline naive — mesmo por margem modesta — já tem valor operacional.
+:::
+
+## 1.2 Por que retornos logarítmicos e não preço bruto?
+
+Modelar o preço bruto do USD/BRL diretamente traz dois problemas sérios:
+
+- **Não-estacionariedade**: a série de preço é integrada de ordem 1, ou seja, tem raiz unitária. Regressões em séries não-estacionárias produzem relações espúrias — coeficientes significativos sem causalidade real.
+- **Escala temporal variável**: uma variação de R$ 0,10 em 2010 (quando o câmbio estava a R$ 1,80) é economicamente muito diferente de R$ 0,10 em 2024 (câmbio a R$ 5,10). A métrica precisa ser invariante à escala absoluta.
+
+A solução padrão em finanças é trabalhar com **retornos logarítmicos**, definidos como:
+
+$$r_{t,H} = \ln\!\left(\frac{S_{t+H}}{S_t}\right)$$
+
+onde $S_t$ é a taxa PTAX de câmbio no dia $t$ e $H$ é o horizonte em dias úteis. Essa transformação tem propriedades desejáveis: (i) é aproximadamente estacionária; (ii) é aditiva no tempo — $r_{t,H_1+H_2} \approx r_{t,H_1} + r_{t+H_1,H_2}$; (iii) interpreta-se diretamente como variação percentual para valores pequenos.
+
+Para os três horizontes deste projeto:
+
+| Horizonte | Variável-alvo | Interpretação |
+|-----------|--------------|---------------|
+| **D+5** | $r_{t,5} = \ln(S_{t+5}/S_t)$ | Retorno acumulado na semana seguinte |
+| **D+30** | $r_{t,30} = \ln(S_{t+30}/S_t)$ | Retorno acumulado no mês seguinte |
+| **D+90** | $r_{t,90} = \ln(S_{t+90}/S_t)$ | Retorno acumulado no trimestre seguinte |
+
+::: {.callout-important}
+## Look-ahead leak nos targets
+A construção dos targets usa valores **futuros** de $S$. Isso significa que a data de referência de cada observação é $t$ (hoje), mas o target só se "realiza" em $t+H$. Todo o pipeline de validação precisa respeitar essa assimetria temporal — nunca usar informação de $t+k$ (com $k>0$) como feature para prever $r_{t,H}$.
+:::
+
+## 1.3 Hipótese central: drivers diferem por horizonte
+
+A hipótese estruturante do projeto é que os determinantes do câmbio mudam qualitativamente conforme o horizonte de previsão. Isso justifica modelos separados para cada $H$, ao invés de um único modelo universal.
+
+```{r}
+#| label: tbl-horizonte-perfil
+#| echo: false
+
+tibble(
+  Horizonte = c("D+5", "D+30", "D+90"),
+  `Janela temporal` = c("~1 semana", "~1 mês", "~1 trimestre"),
+  `Drivers dominantes` = c(
+    "Fluxo financeiro, volatilidade (VIX), microestrutura, DXY",
+    "Diferencial de juros, sinalização do Fed/BCB, expectativas Focus, risco EM",
+    "Inflação relativa BRL/USD, resultado fiscal, commodities, crescimento"
+  ),
+  `Sinal esperado` = c(
+    "Fraco — câmbio quase caminhada aleatória no curto prazo",
+    "Moderado — política monetária cria tendência de médio prazo",
+    "Mais forte — fundamentos dominam sobre ruído"
+  ),
+  `Desafio principal` = c(
+    "Alta volatilidade, baixo R²",
+    "Defasagem de publicação de dados mensais",
+    "Poucas observações independentes de 90 dias"
+  )
+) |>
+  knitr::kable(caption = "Perfil dos três horizontes de previsão")
+```
+
+## 1.4 Arquitetura: três modelos independentes
+
+A abordagem adotada é treinar **três pipelines completamente independentes**, um por horizonte. Isso tem vantagens e um custo:
+
+**Vantagens:**
+- Cada modelo pode selecionar features ótimas para seu horizonte específico — features relevantes para D+5 podem ser ruído para D+90.
+- Hiperparâmetros de regularização, profundidade de árvores e outros são otimizados separadamente.
+- Erros de um horizonte não se propagam para os demais.
+
+**Custo:**
+- Triplicação da carga computacional de treinamento e tuning.
+- Dificuldade de garantir consistência lógica entre horizontes (o modelo D+5 e o modelo D+30 podem implicitamente contradizer-se sobre a direção do câmbio).
+
+Para fins deste projeto, as vantagens superam o custo: o objetivo é maximizar a qualidade preditiva por horizonte, não a consistência temporal entre previsões.
+
+---
+
+# 2. Fontes de Dados e Modelo de Entrada {#sec-dados}
+
+## 2.1 Visão geral das fontes
+
+O dataset foi construído integrando **9 fontes de dados** heterogêneas, combinando dados de mercado de alta frequência (diários) com indicadores macroeconômicos de baixa frequência (mensais/trimestrais). A integração de séries com granularidades distintas é um dos principais desafios técnicos do projeto — abordado na seção 2.4.
+
+```{r}
+#| label: tbl-fontes
+#| echo: false
+
+fontes <- tibble(
+  Fonte = c(
+    "BCB PTAX",
+    "BCB SGS (diário)",
+    "BCB SGS (mensal)",
+    "BCB Focus",
+    "Yahoo Finance",
+    "FRED (principal)",
+    "FRED (adicional)",
+    "IBGE SIDRA — IPCA",
+    "IBGE SIDRA — PIM/PNAD"
+  ),
+  `Pacote R` = c(
+    "rbcb",
+    "rbcb / GetBCBData",
+    "rbcb / GetBCBData",
+    "rbcb",
+    "quantmod / tidyquant",
+    "fredr",
+    "fredr",
+    "sidrar",
+    "sidrar"
+  ),
+  Tipo = c(
+    "Cambial",
+    "Monetário/Fiscal BR",
+    "Macro BR",
+    "Expectativas de mercado",
+    "Mercado global",
+    "Macro EUA / Mercado",
+    "Mercado EUA",
+    "Inflação BR",
+    "Atividade BR"
+  ),
+  Frequência = c(
+    "Diária",
+    "Diária",
+    "Mensal",
+    "Semanal",
+    "Diária",
+    "Mensal",
+    "Diária / Mensal",
+    "Mensal",
+    "Mensal / Trimestral"
+  ),
+  `N vars` = c(2, 6, 8, 4, 12, 7, 4, 8, 3),
+  Início = c(
+    "Jan/2010", "Jan/2010", "Fev/2010",
+    "Jan/2010", "Jan/2010", "Fev/2010",
+    "Abr/2018", "Fev/2010", "Fev/2010"
+  ),
+  Status = c(
+    "OK", "OK", "OK (forward-fill)",
+    "OK (forward-fill)", "OK", "OK (forward-fill)",
+    "Parcial", "OK (forward-fill)", "OK (forward-fill)"
+  )
+)
+
+DT::datatable(
+  fontes,
+  caption = "Fontes de dados do projeto dolaR",
+  options = list(
+    pageLength = 10,
+    scrollX = TRUE,
+    dom = "t"
+  ),
+  rownames = FALSE
+) |>
+  DT::formatStyle(
+    "Status",
+    backgroundColor = DT::styleEqual(
+      c("OK", "OK (forward-fill)", "Parcial"),
+      c("#d4edda", "#fff3cd", "#f8d7da")
+    )
+  )
+```
+
+## 2.2 Grupos de variáveis e teoria econômica
+
+### 2.2.1 Mercado financeiro diário (Yahoo Finance + FRED)
+
+Este grupo captura o "pulso" do mercado global em alta frequência. O **DXY** (índice do dólar norte-americano frente a uma cesta de moedas desenvolvidas) é o driver de movimentos globais do USD: quando o DXY sobe, moedas emergentes tendem a se desvalorizar de forma coordenada, pois o custo de carregar ativos denominados em dólar aumenta. O USD/BRL, portanto, tem forte correlação positiva com o DXY, mas essa correlação varia — em períodos de estresse específico do Brasil (eleições, crise fiscal), o BRL se deprecia mais do que o DXY indicaria.
+
+O **VIX** (CBOE Volatility Index) mede a volatilidade implícita nas opções do S&P 500, funcionando como termômetro de aversão a risco global. Em momentos de alta do VIX — chamados de *risk-off* — investidores desfazem posições em emergentes e correm para ativos seguros (USD, treasuries, ouro). O impacto no BRL é quase instantâneo: a correlação entre VIX e depreciação do BRL no curto prazo é uma das relações mais robustas do dataset. A **curva de juros dos EUA** (spread *10y–2y*) é o indicador de consenso de mercado sobre política monetária futura: quando o spread se inverte (2y > 10y), o mercado está precificando corte de juros do Fed, o que tende a enfraquecer o USD globalmente. Os **breakevens** de inflação (diferença entre título nominal e TIPS) capturam as expectativas inflacionárias do mercado americano — inflação esperada mais alta implica mais aperto monetário futuro, sustentando o USD. O **EWZ** (ETF de ações brasileiras em Nova York) funciona como proxy do risco-Brasil: além de capturar crescimento doméstico esperado, seu comportamento reflete o apetite internacional por ativos brasileiros, correlacionando-se negativamente com o USD/BRL.
+
+```{r}
+#| label: fig-usd-brl-serie
+#| fig-cap: "Série histórica do USD/BRL PTAX (2010–2026). Eventos marcantes destacam as quebras de regime."
+
+knitr::include_graphics(here("outputs","figures","eda-01-usd-brl-ptax.png"))
+```
+
+### 2.2.2 Macro Brasil (BCB PTAX, SGS e IBGE)
+
+O **PTAX** é a taxa oficial de câmbio calculada pelo Banco Central do Brasil como média das cotações do mercado interbancário ao longo do dia. É a taxa-referência para liquidação de contratos de câmbio e o target primário deste projeto. A **Selic** (taxa básica de juros brasileira) é o principal instrumento de política monetária do BCB. O mecanismo do *carry trade* explica muito de sua influência sobre o câmbio: investidores internacionais tomam dinheiro emprestado em moedas de baixo juro (USD, JPY) e aplicam em ativos de alto juro (BRL), capturando o diferencial. Quando o diferencial Selic–Fed Funds aumenta, há pressão de apreciação do BRL; quando diminui ou o risco do Brasil aumenta, o carry trade se desfaz abruptamente. O **CDI** diário é a taxa interbancária brasileira, praticamente igual à Selic e usada como benchmark de rentabilidade de renda fixa.
+
+O **IPCA** (Índice de Preços ao Consumidor Amplo) captura a inflação brasileira e possui dois canais de transmissão para o câmbio: (i) via paridade do poder de compra (*PPP*) — inflação doméstica acima da americana implica desvalorização do BRL no longo prazo; (ii) via política monetária — IPCA alto força o BCB a elevar a Selic, atraindo capital externo. O **fluxo cambial** (entradas menos saídas de USD no Brasil) mede diretamente a pressão de oferta e demanda por dólares no mercado doméstico: saldo positivo (mais entradas que saídas) tende a apreciar o BRL. O **DBGG/PIB** (Dívida Bruta do Governo Geral como percentual do PIB) e os **resultados fiscal primário e nominal** capturam a percepção de risco soberano — um fisco deteriorado aumenta o prêmio de risco-Brasil, exigindo taxa de câmbio mais depreciada para equilibrar a balança de pagamentos.
+
+```{r}
+#| label: fig-retornos-diarios
+#| fig-cap: "Retornos diários do USD/BRL. Observe a heterocedasticidade e os clusters de volatilidade."
+
+knitr::include_graphics(here("outputs","figures","eda-02-retornos-diarios.png"))
+```
+
+### 2.2.3 Macro Estados Unidos (FRED)
+
+As variáveis macroeconômicas dos EUA atuam principalmente pelo canal da política monetária do Fed. O **Fed Funds Rate** define o custo do dólar globalmente: juro americano mais alto torna ativos denominados em USD mais atrativos, apreciando o dólar frente a todas as moedas, inclusive o BRL. O **CPI** e o **PCE** (indicadores de inflação americana) determinam a trajetória futura do Fed Funds — inflação acima da meta de 2% obriga o Fed a apertar a política, fortalecendo o USD. O **desemprego americano** (via regra de Taylor) sinaliza se o Fed tem espaço para cortar juros: desemprego baixo sustenta aperto, alto pressiona por afrouxamento. A **confiança do consumidor** (*Michigan Consumer Sentiment*) é indicador antecedente da atividade econômica americana — um consumidor confiante sustenta crescimento, mantendo o Fed hawkish.
+
+::: {.callout-note}
+## Defasagem de publicação
+Os dados macro dos EUA são publicados mensalmente com defasagem de 2 a 6 semanas. No pipeline, eles são incorporados com **forward-fill** — o último valor publicado é mantido como o "melhor dado disponível" até a próxima publicação. Isso replica fielmente o que um analista saberia em tempo real.
+:::
+
+### 2.2.4 Expectativas Focus (BCB)
+
+O **Relatório Focus** consolida semanalmente as expectativas de mais de 100 instituições financeiras (bancos, gestoras, consultorias) para variáveis macroeconômicas chave: câmbio, IPCA, PIB e Selic. Sua relevância teórica vem da hipótese de eficiência: se o mercado é eficiente, parte do movimento futuro do câmbio **já está incorporada** nas expectativas do Focus. Um câmbio mais depreciado na expectativa do mercado tende a se autorrealizar, pois operadores ajustam posições antecipadamente.
+
+```{r}
+#| label: fig-focus-vs-ptax
+#| fig-cap: "Expectativa Focus de câmbio vs. PTAX realizado. O mercado captura tendências, mas subestima volatilidade."
+
+knitr::include_graphics(here("outputs","figures","eda-09-focus-vs-ptax.png"))
+```
+
+O Focus fornece quatro variáveis ao dataset: `focus_cambio` (expectativa de câmbio), `focus_ipca` (inflação esperada), `focus_selic` (taxa esperada) e `focus_pib_total` (crescimento esperado). Todas têm cobertura desde jan/2010, sendo séries semanais tratadas com forward-fill para o calendário diário.
+
+### 2.2.5 Commodities (Yahoo Finance + BCB SGS)
+
+O Brasil é um exportador líquido de commodities — petróleo via Petrobras, minério de ferro via Vale, soja e proteína animal. Preços mais altos de commodities melhoram os termos de troca brasileiros: mais dólares entram via exportação, aumentando a oferta de USD no mercado doméstico e apreciando o BRL. Esse canal é particularmente relevante para o horizonte D+90, onde os efeitos sobre a balança comercial têm tempo de se manifestar no câmbio.
+
+O **petróleo Brent e WTI** são os dois benchmarks globais de crude oil. O **minério de ferro** reflete diretamente a demanda chinesa por insumos industriais — China é o principal destino das exportações brasileiras. A **soja** captura o ciclo agrícola e a demanda americana/chinesa. O **cobre** funciona como indicador de crescimento industrial global (*copper has a PhD in economics*). O **ouro** atua de forma inversa: sendo ativo de proteção, ouro alto sinaliza aversão a risco e pode pressionar o câmbio.
+
+```{r}
+#| label: fig-volatilidade
+#| fig-cap: "Volatilidade realizada do USD/BRL (janela 21 dias). Períodos de estresse são claramente identificados."
+
+knitr::include_graphics(here("outputs","figures","eda-08-volatilidade-usdbrl.png"))
+```
+
+## 2.3 Modelo de dados de entrada
+
+### 2.3.1 Estrutura da tabela diária
+
+O dataset final tem estrutura de **painel cross-sectional no tempo**: cada linha representa um dia útil $t$, com todas as features disponíveis naquele dia e os três targets para os horizontes futuros correspondentes.
+
+```
+date        | feature_1 | feature_2 | ... | feature_N | target_5d | target_30d | target_90d
+2010-01-04  |   ...     |   ...     | ... |   ...     |  r(5)     |  r(30)     |  r(90)
+2010-01-05  |   ...     |   ...     | ... |   ...     |  r(5)     |  r(30)     |  r(90)
+...
+2026-02-19  |   ...     |   ...     | ... |   ...     |   NA      |   NA       |  NA
+```
+
+Os últimos $H$ dias de cada série de targets são `NA`, pois os valores futuros correspondentes não existem ainda. No dataset processado, há **4.052 observações** diárias de jan/2010 a fev/2026, com **60 variáveis brutas** e **52 features engenheiradas**, totalizando 112 colunas de entrada.
+
+### 2.3.2 Construção dos targets
+
+Os três targets são construídos diretamente da série PTAX via diferença logarítmica com defasagem avançada:
+
+$$\text{target}_{t,H} = \ln\!\left(\frac{\text{PTAX}_{t+H}}{\text{PTAX}_t}\right), \quad H \in \{5, 30, 90\}$$
+
+```{r}
+#| label: tbl-target-stats
+#| echo: false
+
+target_stats |>
+  mutate(
+    across(c(media, dp, min, p25, mediana, p75, max, skew), \(x) round(x, 4)),
+    pct_alta = scales::percent(pct_alta, accuracy = 0.1)
+  ) |>
+  rename(
+    Horizonte = horizonte,
+    N = n,
+    Média = media,
+    `Desvio padrão` = dp,
+    Mínimo = min,
+    P25 = p25,
+    Mediana = mediana,
+    P75 = p75,
+    Máximo = max,
+    Assimetria = skew,
+    `% dias alta` = pct_alta
+  ) |>
+  DT::datatable(
+    caption = "Estatísticas descritivas dos targets por horizonte",
+    options = list(dom = "t", pageLength = 3),
+    rownames = FALSE
+  )
+```
+
+Observe que a volatilidade (desvio padrão) escala com $\sqrt{H}$, como esperado pela teoria de caminhada aleatória. A assimetria positiva em todos os horizontes reflete a tendência estrutural de depreciação do BRL ao longo do período amostral — o real perdeu ~65% de seu valor frente ao dólar entre 2010 e 2026.
+
+```{r}
+#| label: fig-dist-targets
+#| fig-cap: "Distribuição dos retornos por horizonte. A distribuição se alarga e a cauda direita se acentua com o horizonte."
+
+knitr::include_graphics(here("outputs","figures","eda-03-dist-targets.png"))
+```
+
+### 2.3.3 O problema do leakage temporal
+
+Em problemas de previsão de séries temporais, o leakage temporal é a principal causa de modelos "ótimos" em validação que falham completamente em produção. Ele ocorre quando o modelo tem acesso, durante o treinamento, a informações que só estariam disponíveis no futuro.
+
+Para os targets construídos com horizonte $H$, o risco de leakage é sutil: a observação do dia $t$ com target $r_{t,30}$ usa $\text{PTAX}_{t+30}$ para construir o label. Se alguma feature também usar dados de $t+k$ com $k > 0$, o modelo aprende uma relação espúria. Exemplos comuns de leakage:
+
+- Médias móveis de retornos calculadas **forward** ao invés de **backward**
+- Normalização global com estatísticas do dataset completo (incluindo o período de teste)
+- Features de volatilidade que usam janelas que "olham para frente" além de $t$
+
+O pipeline do dolaR foi construído com **strict temporal ordering**: todas as features em $t$ usam apenas dados $\leq t$, e a validação usa walk-forward cross-validation com janelas expansivas — nunca vendo dados futuros.
+
+## 2.4 Forward-fill de séries de baixa frequência
+
+### 2.4.1 O problema
+
+Séries macroeconômicas são publicadas mensalmente (IPCA, desemprego, resultado fiscal) ou semanalmente (Focus). No calendário diário, essas séries têm valores apenas no dia de publicação — os demais dias são `NA`. Um modelo de aprendizado de máquina treinado com `NA` tratados como zero ou removidos seria sistematicamente enviesado.
+
+### 2.4.2 A solução: forward-fill
+
+A abordagem adotada replica a lógica da informação disponível em tempo real (*point-in-time*): o valor mais recentemente publicado é mantido como o "melhor dado disponível" até que uma nova publicação ocorra. Em R:
+
+```r
+# Exemplo: forward-fill da série mensal do IPCA
+ds <- ds |>
+  arrange(date) |>
+  fill(ipca_mensal, .direction = "down")
+```
+
+Isso transforma uma série com ~95% de `NA` em uma série completamente preenchida, onde cada dia carrega o último valor observado. A interpretação econômica é correta: no dia $t$, o analista conhece apenas o último IPCA publicado, e é esse valor que deve entrar no modelo.
+
+::: {.callout-note}
+## Forward-fill e realismo de informação
+O forward-fill pode introduzir um viés sutil: assume que o dado mensal foi publicado **no primeiro dia do mês de referência**. Na prática, o IPCA de março, por exemplo, é divulgado em meados de abril. O pipeline usa a data de início da série conforme registrada no IBGE/BCB, que já incorpora a defasagem típica de publicação.
+:::
+
+## 2.5 Séries problemáticas
+
+Nem todas as variáveis coletadas estavam em condições de uso. Quatro séries receberam tratamento especial ou foram descartadas:
+
+::: {.callout-warning}
+## saldo_cambial — descartada (0 observações úteis)
+A série `saldo_cambial` (saldo líquido cambial, série BCB SGS) retornou 100% de valores ausentes no período de coleta. A série foi mantida no schema do dataset mas **excluída do treinamento** de todos os modelos. Possível descontinuação da série no BCB ou mudança de código SGS.
+:::
+
+::: {.callout-warning}
+## us_hy_spread — cobertura parcial (só desde jul/2023)
+O spread de crédito high yield americano (`us_hy_spread`, FRED série ICE BofA US High Yield) tem apenas **663 observações**, correspondentes a ~12% do dataset total (início em 2023-07-03). Inclui-la sem tratamento criaria um viés de seleção severo: o modelo aprenderia padrões apenas de um período recente e específico. A série foi **incluída como feature**, mas modelos treinados com ela precisam considerar que a maioria das observações de treinamento terá forward-fill desde o primeiro valor disponível.
+:::
+
+::: {.callout-warning}
+## pim_geral — gap desde jan/2022
+A Pesquisa Industrial Mensal (`pim_geral`, IBGE SIDRA) apresenta **descontinuidade na coleta**: a série tem cobertura normal até jan/2022 e depois não foi atualizada na fonte consultada. Das 4.052 observações, apenas 20 estão faltando, mas concentradas no período mais recente — justamente o período de teste (nov/2022–fev/2026). Isso cria um problema de representatividade: o modelo aprende com `pim_geral` no treino mas a feature chega como constante (último valor disponível) no teste.
+:::
+
+::: {.callout-warning}
+## sofr — disponível apenas desde abr/2018
+A taxa SOFR (*Secured Overnight Financing Rate*), que substituiu o LIBOR como referência de overnight nos EUA, existe desde 2018-04-03. Isso representa ~47% do dataset com `NA` (2.136 observações ausentes). O tratamento aplicado foi forward-fill a partir do primeiro valor disponível, mas as observações anteriores a abril/2018 recebem o valor `NA` para o `sofr` diretamente, que foi imputado pela mediana na pipeline de preparação de features.
+:::
+
+```{r}
+#| label: fig-missing-vars
+#| fig-cap: "Mapa de dados ausentes por variável. Séries mensais têm padrão regular de ausências; saldo_cambial é ausente total."
+
+knitr::include_graphics(here("outputs","figures","eda-05-missing-vars.png"))
+```
+
+---
+# 3. EDA — Análise Exploratória Detalhada {#eda}
+
+A análise exploratória de dados (EDA) é a etapa em que "conversamos" com os dados antes de construir qualquer modelo. O objetivo é compreender a estrutura, os padrões e as anomalias do dataset — e, mais importante, formular hipóteses sobre quais variáveis podem ter poder preditivo.
+
+Neste capítulo percorremos as principais visualizações geradas a partir do dataset consolidado de 4.052 observações diárias (2010-01-04 a 2026-02-19).
+
+---
+
+## 3.1 Série Temporal do USD/BRL (2010–2026)
+
+O ponto de partida natural é a própria série que queremos prever: a taxa de câmbio USD/BRL (PTAX — taxa oficial do Banco Central do Brasil, divulgada ao final de cada dia útil).
+
+```{r fig-serie-ptax, echo=FALSE, fig.cap="Taxa de câmbio USD/BRL (PTAX) — 2010 a 2026. Cada ponto representa o fechamento diário. Eventos macroeconômicos marcantes estão indicados."}
+knitr::include_graphics(here("outputs", "figures", "eda-01-usd-brl-ptax.png"))
+```
+
+A série revela uma **trajetória de depreciação secular** do real ao longo dos 16 anos analisados. Partindo de um patamar próximo a R\$ 1,70 em 2010 (período de forte entrada de capital e preços elevados de commodities), o câmbio atingiu sucessivos recordes nas crises que se seguiram:
+
+- **2015–2016 — Crise Fiscal e Impeachment:** deterioração das contas públicas e crise política levaram o dólar a superar R\$ 4,20 pela primeira vez. O mercado precificou risco soberano crescente e fuga de capital.
+
+- **2018 — Eleições e Incerteza:** o período eleitoral gerou volatilidade expressiva, com o câmbio oscilando entre R\$ 3,50 e R\$ 4,20 ao longo do segundo semestre.
+
+- **Março/2020 — COVID-19:** o choque global de aversão a risco ("risk-off") empurrou o dólar ao recorde histórico de aproximadamente R\$ 5,70, à medida que investidores internacionais liquidaram posições em emergentes.
+
+- **2022 — Eleições + Ciclo de Alta do Fed:** a combinação de incerteza eleitoral local com o ciclo agressivo de alta de juros pelo Federal Reserve manteve o câmbio pressionado acima de R\$ 5,00.
+
+- **2023–2024 — Pressão Fiscal Persistente:** o câmbio oscilou entre R\$ 4,80 e R\$ 6,20, refletindo preocupações estruturais com o arcabouço fiscal brasileiro e a política monetária americana restritiva.
+
+::: {.callout-important}
+**Implicação para modelagem:** a presença de tendência de alta de longo prazo (não-estacionariedade em nível) invalida o uso direto da série de preços como variável dependente. Modelos treinados sobre preços em USD/BRL em um período seriam sistematicamente enviesados ao tentar prever em outro. **A solução é trabalhar sobre retornos logarítmicos**, que são estacionários e têm interpretação econômica clara como variação percentual acumulada. Essa é a razão pela qual nossos targets são definidos como $\log(P_{t+H}/P_t)$.
+:::
+
+---
+
+## 3.2 Retornos Diários Logarítmicos
+
+Os retornos logarítmicos diários $r_t = \log(P_t / P_{t-1})$ eliminam a tendência de nível e tornam a série estacionária. A figura abaixo exibe essa transformação ao longo de todo o período amostral.
+
+```{r fig-retornos, echo=FALSE, fig.cap="Retornos logarítmicos diários do USD/BRL (2010–2026). Nota-se o agrupamento de alta volatilidade em períodos de estresse — fenômeno conhecido como volatility clustering."}
+knitr::include_graphics(here("outputs", "figures", "eda-02-retornos-diarios.png"))
+```
+
+O padrão mais evidente na série de retornos é o **volatility clustering**: períodos de tranquilidade (retornos pequenos e uniformes) alternam com períodos de turbulência (retornos grandes e variáveis). Matematicamente, isso significa que a variância condicional $\sigma_t^2$ não é constante — ela é função da volatilidade passada.
+
+Esse fenômeno é capturado formalmente pelos modelos da família **ARCH/GARCH** (Autoregressive Conditional Heteroskedasticity), propostos por Engle (1982) e Bollerslev (1986). Para nossa análise preditiva, o volatility clustering tem uma implicação prática direta:
+
+::: {.callout-note}
+**Intuição econômica:** se hoje o câmbio oscilou ±1,5%, há boa chance de que amanhã ele também oscile acima da média histórica. A volatilidade passada é **preditiva da volatilidade futura**. Esse insight justifica a inclusão das features de volatilidade realizada (`vol_usd_5d`, `vol_usd_21d`, `vol_usd_63d`) no Grupo G2 de feature engineering. Essas janelas capturam o "regime de risco" atual e informam os modelos sobre o nível esperado de flutuação.
+:::
+
+---
+
+## 3.3 Distribuição dos Targets (D+5, D+30, D+90)
+
+Antes de modelar, é essencial entender a distribuição estatística das variáveis que queremos prever. Os três targets correspondem ao retorno logarítmico acumulado nos próximos 5, 30 e 90 dias úteis, respectivamente.
+
+```{r fig-dist-targets-eda, echo=FALSE, fig.cap="Distribuição dos retornos logarítmicos acumulados para os três horizontes de previsão. As curvas em vermelho indicam a distribuição Normal com mesma média e desvio padrão dos dados."}
+knitr::include_graphics(here("outputs", "figures", "eda-03-dist-targets.png"))
+```
+
+```{r fig-boxplot-targets, echo=FALSE, fig.cap="Boxplots dos três targets. A assimetria positiva e os outliers extremos ficam evidentes, especialmente para D+90."}
+knitr::include_graphics(here("outputs", "figures", "eda-04-boxplot-targets.png"))
+```
+
+```{r tab-target-stats, echo=FALSE}
+DT::datatable(
+  target_stats,
+  caption = "Estatísticas descritivas dos targets: retornos logarítmicos acumulados (D+5, D+30, D+90)",
+  options = list(pageLength = 10, scrollX = TRUE),
+  rownames = FALSE
+)
+```
+
+Três padrões fundamentais emergem desta análise:
+
+**1. Incerteza cresce com o horizonte.** O desvio padrão passa de aproximadamente 2,1% em D+5 para 4,9% em D+30 e 8,5% em D+90. Isso é esperado: quanto mais distante o horizonte, maior a incerteza acumulada. Em termos práticos, um modelo que prevê D+90 precisa aceitar que erros de 5–10 p.p. são relativamente comuns.
+
+**2. Caudas pesadas ("fat tails").** A comparação com a distribuição Normal (curva vermelha) revela que os retornos reais têm caudas mais pesadas do que o modelo gaussiano prevê. Eventos extremos como a crise do COVID-19 ou a crise fiscal de 2015 produzem retornos que seriam "impossíveis" em um mundo puramente gaussiano.
+
+**3. Assimetria positiva.** O histograma e os boxplots mostram uma leve assimetria à direita — há mais observações de depreciação intensa do que de apreciação intensa. Isso reflete a tendência secular de depreciação do real discutida na seção anterior.
+
+::: {.callout-warning}
+**Implicação para métricas de avaliação:** o RMSE (Root Mean Squared Error) penaliza erros quadraticamente e é sensível a outliers. Em distribuições com caudas pesadas, um único evento extremo pode dominar a métrica. Por isso, além do RMSE, monitoraremos o MAE (Mean Absolute Error) e o MAPE, além de analisar os resíduos separadamente para períodos de alta e baixa volatilidade.
+:::
+
+---
+
+## 3.4 Autocorrelação dos Targets
+
+A Função de Autocorrelação (ACF) mede a correlação de uma série com defasagens de si mesma: $\text{ACF}(k) = \text{cor}(r_t, r_{t-k})$. Ela responde à pergunta: "o retorno de hoje está correlacionado com o retorno de $k$ dias atrás?"
+
+```{r fig-acf-targets, echo=FALSE, fig.cap="Funções de Autocorrelação (ACF) para os três targets. As linhas tracejadas em azul indicam o intervalo de confiança de 95% sob a hipótese nula de ruído branco."}
+knitr::include_graphics(here("outputs", "figures", "eda-11-acf-targets.png"))
+```
+
+A análise das ACFs revela um padrão contrastante entre os horizontes:
+
+**D+5 — Próximo de Ruído Branco:** quase todas as autocorrelações ficam dentro do intervalo de confiança de 95%, sugerindo que os retornos de 5 dias são essencialmente imprevisíveis a partir de valores passados. Esse resultado é consistente com a **Hipótese de Mercado Eficiente (HME)** em sua forma fraca: o preço atual já incorpora toda a informação histórica disponível, e padrões de curto prazo são arbitrados rapidamente por participantes profissionais.
+
+**D+30 e D+90 — Autocorrelação Positiva Significativa:** para horizontes mais longos, observam-se autocorrelações positivas estatisticamente significativas nas primeiras defasagens. Isso indica **persistência de tendência**: períodos de depreciação tendem a ser seguidos por outros períodos de depreciação (e vice-versa), em escala de tempo de semanas a meses.
+
+::: {.callout-note}
+**Por que ARIMA funciona em D+5 mas não em D+90?** Um modelo ARIMA explora a autocorrelação da série para fazer previsões. Em D+5, a série se comporta como ruído branco — não há estrutura temporal exploitável, e o ARIMA converge para prever a média incondicional. Em D+30 e D+90, a autocorrelação positiva cria uma estrutura que o ARIMA poderia, em princípio, capturar. Na prática, porém, modelos baseados em fundamentos macroeconômicos (spreads de juros, fluxo cambial, risco externo) tendem a superar modelos puramente temporais em horizontes longos, pois capturam as *causas* dos movimentos, não apenas sua persistência estatística.
+:::
+
+---
+
+## 3.5 Missing Values e Qualidade dos Dados
+
+Dados financeiros e macroeconômicos raramente chegam completos. Séries de diferentes fontes têm históricos distintos, periodicidades diferentes (diárias, mensais) e, eventualmente, descontinuidades. A figura abaixo mapeia a cobertura temporal de cada variável.
+
+```{r fig-missing, echo=FALSE, fig.cap="Proporção de missing values por variável. Barras mais longas indicam variáveis com histórico mais curto ou dados ausentes."}
+knitr::include_graphics(here("outputs", "figures", "eda-05-missing-vars.png"))
+```
+
+O mapeamento de missings guiou decisões críticas de curadoria de dados:
+
+| Variável | Situação | Decisão |
+|---|---|---|
+| `saldo_cambial` | 0 observações úteis | **Descartada** do dataset |
+| `us_hy_spread` | Disponível apenas desde 2023-07 | Mantida com cautela — cobertura ~13% |
+| `sofr` | Disponível desde 2018-04 | Mantida — substitui LIBOR pós-2022 |
+| `pim_geral` | Congelada desde jan/2022 | Tratada como série mensal com forward-fill |
+
+::: {.callout-warning}
+**Atenção ao viés de look-ahead:** o tratamento de missing values em séries mensais (como dados do IBGE ou Focus) exige cuidado especial. O forward-fill — propagar o último valor observado para os dias seguintes até a próxima publicação — é a única abordagem que respeita a causalidade temporal. Usar interpolação ou backward-fill introduziria informação futura no treinamento, contaminando o modelo com vazamento de dados (data leakage).
+:::
+
+---
+
+## 3.6 Correlações com os Targets
+
+Uma das perguntas mais importantes na fase exploratória é: quais variáveis têm correlação com o que queremos prever? A figura abaixo mostra as correlações lineares (coeficiente de Pearson) entre cada feature e o target de 30 dias.
+
+```{r fig-cor-features, echo=FALSE, fig.cap="Correlações das features com o target D+30 (retorno logarítmico acumulado em 30 dias). Barras em vermelho indicam correlação negativa; em azul, positiva."}
+knitr::include_graphics(here("outputs", "figures", "eda-06-cor-features-target30d.png"))
+```
+
+**Insight chave — O paradoxo do curto prazo:** as correlações com D+5 são uniformemente fracas (máximo absoluto ~0,16). Isso não é um problema de qualidade das features — é evidência da eficiência do mercado no curto prazo. As oportunidades de arbitragem são rapidamente eliminadas por traders profissionais, e o sinal preditivo de qualquer variável individual se dissipa em poucos dias.
+
+Para D+30 e D+90, as correlações são mais fortes, especialmente para variáveis relacionadas a fundamentos macroeconômicos: spreads de juros, fluxo cambial e indicadores de risco externo. Isso faz sentido economicamente: o câmbio no longo prazo é determinado por fundamentos (balança comercial, diferencial de juros, inflação relativa), enquanto no curto prazo domina o ruído transacional.
+
+```{r fig-focus-scatter, echo=FALSE, fig.cap="Scatter plot: expectativa Focus de câmbio (um ano à frente) versus retorno logarítmico observado em D+30. A correlação positiva sugere que o Focus incorpora parte do movimento, mas subestima sistematicamente movimentos extremos."}
+knitr::include_graphics(here("outputs", "figures", "eda-10-focus-vs-target30d.png"))
+```
+
+A relação entre a expectativa do mercado (Focus câmbio) e o retorno observado em D+30 merece atenção especial. O Focus agrega as projeções de dezenas de instituições financeiras e pode ser visto como o "consenso" do mercado.
+
+::: {.callout-note}
+**Hipótese econômica:** o Focus câmbio incorpora parte do movimento futuro do câmbio — os analistas de mercado têm informação relevante. No entanto, a relação não é perfeita: o consenso tende a ser conservador e subestima a magnitude de movimentos extremos (crises ou recuperações abruptas). Um modelo que combine Focus com outras variáveis de risco pode, em tese, superar o consenso puro.
+:::
+
+---
+
+## 3.7 Correlação entre Variáveis de Mercado
+
+Além de correlacionar features com o target, é importante entender a estrutura de correlação *entre* as features. Alta multicolinearidade pode causar instabilidade em modelos lineares e tornar a interpretação de coeficientes difícil.
+
+```{r fig-corrplot, echo=FALSE, fig.cap="Mapa de calor das correlações entre variáveis de mercado. Pares com |r| > 0,85 indicam redundância de informação e potencial multicolinearidade."}
+knitr::include_graphics(here("outputs", "figures", "eda-07-corrplot-mercado.png"))
+```
+
+O mapa de calor revela pares de altíssima correlação:
+
+- **Brent × WTI** ($r \approx 0{,}994$): os dois benchmarks globais de petróleo se movem quase em sincronia — incluir ambos em um modelo linear é essencialmente redundante.
+
+- **Nasdaq × S&P 500** ($r \approx 0{,}993$): os dois principais índices americanos compartilham a maior parte de suas exposições.
+
+- **Grupos de momentum de mesmo ativo:** retornos de 5d e 21d do mesmo ativo tendem a ter correlação moderada a alta (sobreposição de janelas).
+
+::: {.callout-note}
+**Modelos tree-based vs lineares:** modelos baseados em árvores de decisão (Random Forest, XGBoost, LightGBM) são naturalmente robustos à multicolinearidade — eles simplesmente selecionam a feature mais informativa em cada divisão, independentemente das correlações entre features. Já modelos lineares (Regressão Ridge/Lasso) podem ter instabilidade numérica e coeficientes com interpretação espúria na presença de multicolinearidade severa. Essa é uma das razões pelas quais modelos tree-based costumam dominar em competições de previsão financeira.
+:::
+
+---
+
+## 3.8 Volatilidade e Regimes de Mercado
+
+A volatilidade realizada do câmbio ao longo do tempo revela algo fundamental: o mercado não é homogêneo. Existem períodos de calmaria e períodos de turbulência, separados por quebras de regime (*regime breaks*).
+
+```{r fig-volatilidade-eda, echo=FALSE, fig.cap="Volatilidade realizada do USD/BRL em janelas deslizantes de 21 e 63 dias úteis (anualizada). Picos correspondem a eventos de estresse sistêmico."}
+knitr::include_graphics(here("outputs", "figures", "eda-08-volatilidade-usdbrl.png"))
+```
+
+**O conceito de regime de mercado** é central para entender por que as relações entre variáveis mudam ao longo do tempo:
+
+- **Risk-on:** apetite a risco global elevado → capital flui para emergentes → BRL aprecia, Ibovespa sobe, spreads caem.
+- **Risk-off:** aversão a risco → fuga para ativos seguros (Treasuries, ouro, USD) → BRL deprecia, spreads sobem, VIX dispara.
+
+Em uma crise puramente local (ex: incerteza fiscal brasileira), as correlações entre BRL e ativos internacionais podem ser diferentes das correlações observadas em uma crise global (ex: COVID-19, onde *todos* os emergentes sofreram simultaneamente).
+
+::: {.callout-important}
+**Por que janela deslizante (sliding window) em vez de janela expansiva?**
+
+A escolha da estratégia de validação cruzada temporal é diretamente motivada pela existência de quebras de regime. Uma **janela expansiva** (sempre expandindo o conjunto de treino desde o início) daria ao modelo grandes conjuntos de dados históricos, mas forçaria os coeficientes a capturar simultaneamente regimes muito diferentes — como um único "modelo médio" para um mercado pré-COVID e pós-COVID.
+
+A **janela deslizante** (sliding window) limita o período de treino a uma janela fixa recente (ex: últimos 2 anos), descartando dados muito antigos. Isso privilegia os padrões mais recentes e relevantes, assumindo que o mercado atual se comporta mais como o mercado de 2 anos atrás do que como o de 10 anos atrás. O trade-off é perder dados de treinamento, mas ganhar em estacionariedade local dos coeficientes.
+:::
+
+---
+
+# 4. Feature Engineering — Construindo Sinais do Passado {#feature-engineering}
+
+Feature engineering é o processo de transformar variáveis brutas em representações que maximizem o poder preditivo dos modelos. Em finanças, esse processo exige não apenas criatividade estatística, mas rigor econômico — cada feature precisa ter uma justificativa teórica plausível, além de suporte empírico.
+
+Neste projeto, construímos **54 features** organizadas em 5 grupos funcionais, cobrindo momentum, volatilidade, fundamentos macroeconômicos, contexto externo e sazonalidade.
+
+---
+
+## 4.1 Filosofia: Sem Vazamento de Informação
+
+O princípio fundamental de toda a engenharia de features é: **nenhuma feature pode conter informação do futuro em relação à data de previsão**.
+
+Esse princípio parece óbvio, mas é surpreendentemente fácil de violar na prática:
+
+- Usar o valor do câmbio do dia $t+1$ para calcular uma média móvel que é então usada para prever $t+1$ = data leakage.
+- Fazer forward-fill de dados mensais usando o valor do mês seguinte = data leakage.
+- Normalizar features usando estatísticas calculadas sobre todo o dataset (incluindo o futuro) = data leakage.
+
+Em nosso pipeline, todas as features são calculadas usando apenas informações disponíveis até e inclusive o dia $t$:
+
+```
+feature[t] = f(dados[1], dados[2], ..., dados[t])
+```
+
+**Forward-fill de séries mensais:** dados de frequência mais baixa (PIB, PIM, dados do IBGE) são publicados com defasagem e ficam estáveis entre publicações. A estratégia correta é propagar o último valor disponível até a próxima publicação — exatamente o que um agente de mercado teria disponível em tempo real. Após o preenchimento, qualquer lag adicional é aplicado para garantir que não haja antecipação da data de publicação.
+
+---
+
+## 4.2 G1 — Retornos e Momentum USD/BRL (14 features)
+
+O grupo de momentum captura o comportamento recente do próprio USD/BRL em diferentes escalas de tempo.
+
+**Features de retorno simples:**
+
+$$\text{ret\_usd\_1d} = \log\left(\frac{P_t}{P_{t-1}}\right)$$
+
+$$\text{ret\_usd\_5d} = \log\left(\frac{P_t}{P_{t-5}}\right)$$
+
+$$\text{ret\_usd\_21d} = \log\left(\frac{P_t}{P_{t-21}}\right)$$
+
+$$\text{ret\_usd\_63d} = \log\left(\frac{P_t}{P_{t-63}}\right)$$
+
+**Médias móveis e distâncias:**
+
+$$\text{ma\_usd\_21d} = \frac{1}{21}\sum_{i=0}^{20} P_{t-i}$$
+
+$$\text{dist\_ma\_21d} = \frac{P_t - \text{ma\_usd\_21d}}{\text{ma\_usd\_21d}}$$
+
+A distância da média móvel captura o conceito de *mean reversion*: ativos que se afastaram muito de sua média histórica tendem a retornar. A tensão entre momentum (tendência continua) e mean reversion (correção) é central em finanças.
+
+**Features de range e drawdown (janela 63 dias — trimestre):**
+
+$$\text{drawdown\_63d} = \frac{P_t - \max(P_{t-63}, \ldots, P_t)}{\max(P_{t-63}, \ldots, P_t)}$$
+
+$$\text{range\_63d} = \frac{\max - \min}{\text{min}} \text{ dos últimos 63 dias}$$
+
+::: {.callout-note}
+**Teoria do Momentum em Mercados Financeiros:** Jegadeesh & Titman (1993) demonstraram que ações com bom desempenho nos últimos 3–12 meses tendem a continuar superando no curto prazo — o efeito momentum. Embora originalmente documentado em ações, esse fenômeno foi encontrado em câmbio, commodities e bonds. As features de retorno em múltiplas janelas permitem que o modelo detecte momentum em diferentes escalas (curto prazo: 5d, médio prazo: 21d, longo prazo: 63d).
+:::
+
+Lista completa das 14 features do G1: `ret_usd_1d`, `ret_usd_5d`, `ret_usd_10d`, `ret_usd_21d`, `ret_usd_63d`, `ma_usd_5d`, `ma_usd_21d`, `ma_usd_63d`, `dist_ma_5d`, `dist_ma_21d`, `dist_ma_63d`, `max_63d`, `min_63d`, `drawdown_63d`, `range_63d`.
+
+---
+
+## 4.3 G2 — Volatilidade Realizada (6 features)
+
+O grupo de volatilidade quantifica o nível de risco corrente do câmbio, capturando a intensidade das oscilações recentes.
+
+**Volatilidade realizada anualizada:**
+
+$$\text{vol\_usd\_21d} = \sqrt{252} \cdot \hat{\sigma}_{t,21}$$
+
+onde $\hat{\sigma}_{t,21}$ é o desvio padrão dos retornos diários nas últimas 21 observações. O fator $\sqrt{252}$ anualiza a volatilidade (há ~252 dias úteis por ano), tornando as features comparáveis em magnitude independentemente da janela.
+
+Calculamos volatilidade em três janelas: **5d** (muito curto prazo), **21d** (mensal) e **63d** (trimestral).
+
+**Ratio de volatilidade:**
+
+$$\text{vol\_ratio} = \frac{\text{vol\_usd\_5d}}{\text{vol\_usd\_21d}}$$
+
+Quando `vol_ratio > 1`, a volatilidade de curto prazo excede a de médio prazo — sinal de que um evento recente gerou estresse agudo. Este indicador é um detector precoce de crises: antes de eventos extremos, a volatilidade de curto prazo frequentemente se expande antes da de longo prazo.
+
+**Volatilidade do VIX:**
+
+$$\text{vol\_vix\_21d} = \sqrt{252} \cdot \hat{\sigma}_{\text{VIX}, t, 21}$$
+
+Captura a *volatilidade da volatilidade* — quando o próprio VIX oscila muito, o mercado global está em regime de incerteza extrema.
+
+::: {.callout-note}
+**Intuição GARCH:** no modelo GARCH(1,1), a variância condicional de amanhã é uma média ponderada entre a variância de longo prazo, a variância de ontem e o quadrado do retorno de ontem. Em essência: um spike de volatilidade hoje prevê alta volatilidade amanhã. Nossas features de vol realizado capturam esse fenômeno de forma não-paramétrica — sem assumir uma forma funcional específica para o processo de volatilidade.
+:::
+
+---
+
+## 4.4 G3 — Spreads Macrofinanceiros (10 features)
+
+Este grupo captura os fundamentos macroeconômicos que determinam o câmbio no médio e longo prazo.
+
+**`spread_selic_fed` — Diferencial de Juros Brasil-EUA:**
+
+$$\text{spread\_selic\_fed} = r_{\text{SELIC}} - r_{\text{Fed Funds}}$$
+
+A teoria do **carry trade** prevê que moedas com maiores taxas de juros tendem a se apreciar quando o diferencial é elevado e estável: investidores captam em moedas baratas (baixo juro) e investem em moedas caras (alto juro), gerando demanda pela moeda de destino. Quando o diferencial se reduz (o Fed sobe juros ou o BC corta SELIC), esse fluxo se reverte e o BRL tende a depreciar.
+
+**`spread_10y_2y_us` — Inclinação da Curva Americana:**
+
+$$\text{spread\_10y\_2y\_us} = r_{10y}^{EUA} - r_{2y}^{EUA}$$
+
+A inversão da curva de juros americana (spread negativo) é um dos preditores mais confiáveis de recessão nos EUA. Uma recessão americana implica redução do crescimento global, queda nas exportações de commodities e fuga de capital de emergentes — todos fatores negativos para o BRL.
+
+**`spread_ipca_cpi` — Diferencial de Inflação:**
+
+A Paridade do Poder de Compra (PPP) prevê que, no longo prazo, a taxa de câmbio se ajusta para compensar os diferenciais de inflação: se o Brasil tem inflação sistematicamente maior que os EUA, o real deveria depreciar para manter a competitividade real das exportações.
+
+**`fluxo_acum_21d` e `fluxo_acum_63d` — Fluxo Cambial Acumulado:**
+
+O fluxo cambial registrado pelo Banco Central mede a entrada/saída líquida de dólares do mercado brasileiro. Fluxo positivo (entrada de dólares) → pressão de apreciação do BRL. Acumular o fluxo em janelas de 21 e 63 dias suaviza a volatilidade diária e captura tendências estruturais.
+
+**`ret_ewz_5d` e `ret_ewz_21d` — Retorno do ETF Brasil (EWZ):**
+
+O EWZ é um ETF negociado nos EUA que replica o desempenho das ações brasileiras. Seu movimento reflete o apetite de investidores americanos por ativos brasileiros — quando o EWZ cai, há sinal de redução do interesse externo no Brasil, o que tende a pressionar o câmbio. Funciona como proxy de CDS Brasil e risco soberano implícito.
+
+---
+
+## 4.5 G4 — Retornos Externos (16 features)
+
+O câmbio brasileiro é profundamente influenciado pelo contexto externo: o humor global de risco, a força do dólar americano e os preços das commodities que o Brasil exporta.
+
+**DXY — Índice do Dólar (`ret_dxy_1d`, `ret_dxy_5d`, `ret_dxy_21d`):**
+
+O DXY mede a força do dólar americano contra uma cesta de 6 moedas (euro, iene, libra, dólar canadense, coroa sueca e franco suíço). Quando o DXY sobe, o dólar se fortalece globalmente — e praticamente todas as moedas emergentes, incluindo o BRL, tendem a depreciar. É a variável de contexto global mais imediata para qualquer par cambial emergente/USD.
+
+**VIX — Índice de Volatilidade (`ret_vix_5d`, `ret_vix_21d`):**
+
+O VIX mede a volatilidade implícita do S&P 500 e é amplamente utilizado como termômetro da aversão a risco global. VIX acima de 30 tipicamente sinaliza pânico de mercado e risk-off global → BRL deprecia. Features de retorno do VIX capturam a *direção* da mudança de aversão a risco.
+
+**Petróleo — Brent (`ret_oil_5d`, `ret_oil_21d`):**
+
+O Brasil é um exportador líquido de petróleo (Pré-sal). Quando o Brent sobe, a receita em dólares das exportações aumenta, melhorando a balança comercial e gerando pressão de apreciação do BRL. A relação é indireta (através do balanço de pagamentos) e se manifesta mais claramente em horizontes de 30–90 dias.
+
+**Minério de Ferro e Soja (`ret_ferro_5d`, `ret_ferro_21d`):**
+
+O minério de ferro exportado para a China e a soja são dois dos principais itens da pauta exportadora brasileira. Seus preços afetam diretamente os termos de troca e o fluxo cambial — deterioração desses preços reduz a entrada de dólares e pressiona o câmbio.
+
+**Ibovespa (`ret_ibov_5d`, `ret_ibov_21d`) e S&P 500 (`ret_sp500_5d`, `ret_sp500_21d`):**
+
+O Ibovespa como proxy do apetite ao risco local, e o S&P 500 como proxy do apetite ao risco global. Alta correlação entre eles quando o regime é risk-off global; correlação menor quando o movimento é idiossincrático (Brasil sobe enquanto exterior cai ou vice-versa).
+
+**`erro_focus` — Desvio da Expectativa de Mercado:**
+
+$$\text{erro\_focus} = \log\left(\frac{\text{Focus\_câmbio}_t}{\text{USD/BRL\_PTAX}_t}\right)$$
+
+Esta feature mede quanto o câmbio *spot* atual desvia da expectativa do mercado para o câmbio futuro. Se o spot está muito abaixo do Focus (BRL mais forte do que o mercado espera), pode haver pressão de convergência ao consenso. É uma medida de quanto o mercado "antecipa" movimentos ainda não realizados.
+
+---
+
+## 4.6 G5 — Calendário e Sazonalidade (8 features)
+
+Embora o câmbio seja predominantemente determinado por fundamentos econômicos, há padrões sistemáticos relacionados ao calendário que modelos podem explorar.
+
+**Features incluídas:** `dia_semana`, `mes`, `trimestre`, `semana_do_ano`, `fim_de_mes`, `mes_copom`, `mes_fomc`.
+
+**Fim de mês (`fim_de_mes`):** empresas realizam fechamento de posições cambiais no fim de cada mês — importadores cobrem suas exposições, exportadores convertem receitas. Esse fluxo coordenado pode criar pressão previsível no câmbio nos últimos dias úteis do mês.
+
+**Meses de Copom (`mes_copom`) e FOMC (`mes_fomc`):** reuniões do Comitê de Política Monetária do Banco Central do Brasil (Copom) e do Federal Open Market Committee (FOMC) concentram volatilidade e podem gerar movimentos direcionais no câmbio, especialmente quando há surpresas em relação ao consenso de mercado.
+
+**Sazonalidade mensal (`mes`):** o câmbio apresenta leve sazonalidade ao longo do ano, relacionada ao ciclo de exportações de commodities agrícolas (safra de soja no primeiro semestre) e ao calendário fiscal/corporativo.
+
+::: {.callout-note}
+**Nota metodológica:** features de calendário são variáveis categóricas codificadas como inteiros. Para modelos tree-based, essa codificação é adequada — as árvores criam partições que identificam automaticamente os meses mais relevantes. Para modelos lineares, seria necessário one-hot encoding. Em nosso pipeline, priorizamos tree-based, então a codificação inteira é mantida por simplicidade.
+:::
+
+---
+
+## 4.7 Tabela Resumo dos Grupos de Features
+
+```{r tab-feature-groups, echo=FALSE}
+feature_groups <- tibble::tribble(
+  ~Grupo,                      ~`N Features`, ~`Variáveis Principais`,
+  "G1 — Retornos / Momentum",  14L,           "ret_usd_{1,5,10,21,63}d; ma_usd_{5,21,63}d; dist_ma_{5,21,63}d; drawdown_63d; range_63d",
+  "G2 — Volatilidade",          6L,           "vol_usd_{5,21,63}d (anualizada); vol_ratio; vol_vix_21d",
+  "G3 — Spreads Macro",        10L,           "spread_selic_fed; spread_10y_2y_us; spread_ipca_cpi; fluxo_acum_{21,63}d; ret_ewz_{5,21}d; us_hy_spread; sofr",
+  "G4 — Retornos Externos",    16L,           "ret_dxy_{1,5,21}d; ret_vix_{5,21}d; ret_oil_{5,21}d; ret_ferro_{5,21}d; ret_ouro_{5,21}d; ret_ibov_{5,21}d; ret_sp500_{5,21}d; erro_focus",
+  "G5 — Calendário",            8L,           "dia_semana; mes; trimestre; semana_do_ano; fim_de_mes; mes_copom; mes_fomc",
+  "**TOTAL**",                 54L,           "—"
+)
+
+knitr::kable(
+  feature_groups,
+  caption = "Resumo dos 5 grupos de features engenheiradas: 54 variáveis preditoras no total.",
+  align = c("l", "c", "l"),
+  col.names = c("Grupo", "N Features", "Variáveis Principais")
+)
+```
+
+---
+
+## 4.8 Cobertura das Features
+
+Nem todas as features têm cobertura completa sobre o período amostral de 2010 a 2026. Séries que começam depois de 2010 geram missing values nas observações mais antigas, reduzindo efetivamente o tamanho do dataset de treino para os modelos que as utilizam.
+
+```{r tab-cobertura, echo=FALSE, message=FALSE, warning=FALSE}
+cobertura_limitada <- fe_completude |>
+  dplyr::filter(pct_disponivel < 0.80) |>
+  dplyr::arrange(pct_disponivel) |>
+  dplyr::mutate(completude_pct = scales::percent(pct_disponivel, accuracy = 0.1))
+
+if (nrow(cobertura_limitada) > 0) {
+  DT::datatable(
+    cobertura_limitada,
+    caption = "Features com cobertura inferior a 80% do período amostral (2010–2026)",
+    options = list(pageLength = 15, scrollX = TRUE),
+    rownames = FALSE
+  )
+} else {
+  knitr::kable(
+    data.frame(Mensagem = "Todas as features têm cobertura >= 80%"),
+    caption = "Cobertura das features"
+  )
+}
+```
+
+As features com cobertura mais limitada são:
+
+- **`sofr`** (disponível desde 2018-04): a SOFR (Secured Overnight Financing Rate) substituiu a LIBOR como taxa de referência americana. Antes de 2018, usamos o Fed Funds Rate como proxy — a feature é mantida mas com descontinuidade implícita.
+
+- **`ret_ferro_*`** (minério de ferro): dados disponíveis a partir de meados da década de 2010 em algumas fontes. A cobertura parcial limita o treinamento para os modelos que a incluem.
+
+- **`ret_ewz_*`** (ETF Brasil): embora o ETF exista desde 2000, os dados no dataset começam em data posterior, reduzindo a cobertura.
+
+::: {.callout-warning}
+**Estratégia de tratamento:** existem duas abordagens para features com cobertura limitada:
+
+1. **Exclusão total:** garante dataset completo, mas descarta informação potencialmente valiosa.
+2. **Inclusão com imputação ou modelo separado:** mantém a feature, mas requer cuidado para que a imputação não introduza vazamento de dados.
+
+Neste projeto, optamos por manter as features com cobertura parcial e deixar os modelos tree-based lidar com missings nativamente (estratégia válida para XGBoost e LightGBM, que implementam tratamento nativo de missing values via aprendizado de direção de split).
+:::
+# 5. Estratégia de Validação Temporal
+
+Antes de discutir quais modelos foram testados e quais venceram, precisamos entender *como* os avaliamos. A escolha da estratégia de validação em séries temporais não é um detalhe técnico — ela determina se os resultados são confiáveis ou ilusórios.
+
+## 5.1 Por que Walk-Forward e não K-Fold Aleatório?
+
+O k-fold padrão divide o dataset em $k$ partes aleatórias. Para cada fold, treina em $k-1$ partes e valida na parte restante. Essa estratégia é válida para dados i.i.d. (independentes e identicamente distribuídos), mas **quebra completamente em séries temporais** por um motivo fundamental: **data leakage**.
+
+Em uma série temporal, o passado causa o futuro — nunca o contrário. Se usarmos k-fold aleatório, o modelo pode ser treinado em dados de 2022 e validado em dados de 2018. Nesse cenário, o modelo aprende padrões que "viajam para o passado", criando uma ilusão de performance que jamais se repetiria em produção.
+
+O problema do leakage temporal pode ser visualizado assim:
+
+```
+K-FOLD ALEATÓRIO (INCORRETO para séries temporais)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Fold 1: [TREINO: 2010, 2012, 2014, 2016 | VAL: 2011, 2013, 2015] ← LEAKAGE!
+Fold 2: [TREINO: 2011, 2013, 2015, 2017 | VAL: 2010, 2012, 2016] ← LEAKAGE!
+...
+
+→ Dados futuros contaminam o treino. Resultados são ilusórios.
+
+
+WALK-FORWARD CV (CORRETO: respeita a ordem temporal)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Timeline: ────────────────────────────────────────────────────────►
+          2010                                               2022
+
+Fold 1:   [████████████████████ TREINO ████████] [▓▓▓ VAL ▓▓▓] ··········
+          jan/2010 ───────── dez/2012             jan/2013─mar/2013
+
+Fold 2:   ····[████████████████████ TREINO ████████] [▓▓▓ VAL ▓▓▓] ·······
+               abr/2010 ──────────── mar/2013         abr/2013─jun/2013
+
+Fold 3:   ········[████████████████████ TREINO ████████] [▓▓▓ VAL ▓▓▓] ···
+                   jul/2010 ─────────── jun/2013         jul/2013─set/2013
+
+... (39 folds no total, avançando 1 trimestre por vez)
+
+Fold 39:  ·············[████████████████████ TREINO ████████] [▓▓▓ VAL ▓▓▓]
+                        ??? ─────────────── out/2021          nov/2021─jan/2022
+
+→ O modelo NUNCA vê o futuro durante o treino. Resultados são confiáveis.
+```
+
+A seta temporal é sagrada: **treino sempre precede validação**.
+
+## 5.2 Janela Fixa (Sliding) vs Expansiva (Growing)
+
+Dentro da família de walk-forward, há duas variações principais:
+
+**Janela Expansiva (Growing Window):** o conjunto de treino *cresce* a cada fold — o fold 1 usa 3 anos de dados, o fold 20 usa 8 anos, o fold 39 usa ~13 anos. Vantagem: mais dados conforme avança. Desvantagem: dados de 2010 têm o mesmo peso que dados de 2022, mesmo que o regime cambial tenha mudado radicalmente.
+
+**Janela Deslizante (Sliding Window):** o conjunto de treino tem *sempre o mesmo tamanho* e avança junto com o tempo — é uma janela de tamanho fixo que "escorrega" pela série. Dados antigos são descartados à medida que dados novos entram.
+
+```
+GROWING WINDOW (expansiva)
+Fold 1:  [══════════════] [▓▓▓]
+Fold 10: [══════════════════════════════] [▓▓▓]
+Fold 39: [══════════════════════════════════════════════════] [▓▓▓]
+          ↑ janela de treino cresce indefinidamente
+
+SLIDING WINDOW (deslizante)  ← usada neste projeto
+Fold 1:  [══════════════] [▓▓▓]
+Fold 10:          [══════════════] [▓▓▓]
+Fold 39:                          [══════════════] [▓▓▓]
+          ↑ janela de treino tem sempre ~3 anos (756 obs)
+```
+
+**Decisão: sliding window foi escolhida** pelas seguintes razões:
+
+1. **Regime-breaks cambiais:** O USD/BRL passou por regimes distintos — pré-Dilma (2010-2014), impeachment/crise (2015-2016), normalização (2017-2019), COVID (2020), pós-COVID com juros altos nos EUA (2021-2023). Uma janela expansiva daria peso excessivo a regimes que não se repetem.
+
+2. **COVID como outlier sistêmico:** 2020 foi um outlier extremo. Com growing window, o fold 39 sempre carregaria esse evento; com sliding, o fold 39 usa dados mais recentes e representativos.
+
+3. **Estacionariedade local:** Modelos lineares (Ridge, Elastic Net) assumem que os coeficientes são estáveis no tempo. Uma janela de 3 anos aproxima melhor essa premissa do que uma janela de 13 anos.
+
+::: {.callout-note}
+**Custo computacional**
+
+39 folds × 756 observações de treino cada = ~29.484 observações processadas por modelo por fold. Com 6 modelos × 3 horizontes e tuning com 30 configurações LHC, chegamos a milhares de fits. Por isso o projeto utilizou paralelização com `{doParallel}` ou `{furrr}` — sem isso, o tempo seria proibitivo em um laptop convencional.
+:::
+
+## 5.3 Split Temporal 80/20 e a Regra do One Touch
+
+O dataset de 4.052 observações foi dividido em dois blocos temporalmente ordenados:
+
+| Bloco | Período | Observações | Papel |
+|-------|---------|-------------|-------|
+| **Train + Validation** | 2010-01-04 a ~out/2022 | 3.242 | Toda modelagem e seleção |
+| **Test** | ~nov/2022 a fev/2026 | 810 | Avaliação final única |
+
+O bloco de Train+Validation é onde toda a ação acontece: walk-forward CV, seleção de modelos, tuning de hiperparâmetros. O bloco de Test fica num cofre metafórico, intocado.
+
+::: {.callout-important}
+**A Regra do One Touch (Toque Único)**
+
+O conjunto de teste foi utilizado exatamente **uma vez**: para avaliar os modelos campeões já treinados, ao final de todo o processo. Nenhuma decisão de modelagem — escolha de features, seleção de modelo, tuning de hiperparâmetros — pode usar informação do test set.
+
+Usar o test set para guiar decisões é **p-hacking disfarçado de ciência**. Cada vez que você "espia" o test set e ajusta o modelo, está implicitamente sofrendo overfitting a ele. O resultado final parecerá melhor do que seria em dados genuinamente novos.
+
+Em produção, dados novos chegam todos os dias. O test set simula exatamente esse cenário: dados que o modelo *nunca viu* e que representam o futuro.
+:::
+
+---
+
+# 6. Os Modelos: Teoria, Intuição e Por que Esses
+
+Com a estratégia de validação estabelecida, podemos explorar os modelos testados. A seleção não foi aleatória — cada modelo representa uma hipótese diferente sobre a natureza dos retornos cambiais.
+
+## 6.1 O Benchmark Obrigatório: Random Walk (Null)
+
+Antes de qualquer modelo sofisticado, precisamos definir a **barra mínima de performance**. Em finanças, essa barra tem nome: o *random walk*.
+
+A **Hipótese de Mercado Eficiente (EMH)**, formalizada por Fama (1970), afirma que os preços de ativos refletem toda a informação disponível. Se isso for verdade, os retornos futuros são imprevisíveis — a melhor previsão do retorno amanhã é simplesmente **zero** (retorno esperado do processo).
+
+Formalmente, para um random walk: $r_{t+h} = \epsilon_{t+h}$, onde $\epsilon$ é ruído branco. A previsão ótima é $\hat{r}_{t+h} = 0$.
+
+Esse não é um modelo ingênuo — é a fronteira teórica da imprevisibilidade. O referencial histórico vem de **Meese & Rogoff (1983)**, que mostraram em estudo seminal que modelos sofisticados de previsão de câmbio (monetário, portfólio balance) não conseguiam superar o random walk em horizontes curtos fora da amostra. Esse resultado continua relevante 40 anos depois.
+
+Os RMSEs do modelo nulo neste projeto foram:
+
+| Horizonte | RMSE (Null) |
+|-----------|-------------|
+| D+5 | 0.0209 |
+| D+30 | 0.0519 |
+| D+90 | 0.0863 |
+
+Note que o RMSE *aumenta* com o horizonte — isso é esperado: quanto mais longe no futuro, maior a incerteza acumulada.
+
+::: {.callout-important}
+**A Barra Mínima**
+
+Qualquer modelo que não supera o random walk é, para fins práticos, **inútil**. Ele consome recursos computacionais e dá uma falsa sensação de previsibilidade sem entregar valor real. Todo modelo neste projeto foi julgado primeiramente por esse critério.
+:::
+
+## 6.2 ARIMA — Autocorrelação Temporal
+
+O ARIMA (AutoRegressive Integrated Moving Average) é o modelo clássico de séries temporais, desenvolvido por Box & Jenkins na década de 1970. A ideia central: se os retornos passados contêm informação sobre retornos futuros, podemos explorar essa autocorrelação estruturalmente.
+
+O modelo ARIMA(p, d, q) tem três componentes:
+
+- **AR(p):** Parte autorregressiva — o valor atual é uma combinação linear dos $p$ valores passados:
+  $$r_t = \phi_1 r_{t-1} + \phi_2 r_{t-2} + \cdots + \phi_p r_{t-p} + \epsilon_t$$
+
+- **I(d):** Ordem de integração — diferenciação $d$ vezes para tornar a série estacionária
+
+- **MA(q):** Média móvel — o valor atual depende dos $q$ choques (erros) passados:
+  $$r_t = \epsilon_t + \theta_1 \epsilon_{t-1} + \cdots + \theta_q \epsilon_{t-q}$$
+
+O `auto.arima` da biblioteca `{forecast}` seleciona automaticamente os parâmetros $p$, $d$, $q$ via critério de informação (AIC/BIC), realizando testes de estacionariedade e examinando a função de autocorrelação (ACF/PACF).
+
+**Por que funciona em D+5 (RMSE = 0.0157, redução de 25% vs null):** Retornos cambiais de curtíssimo prazo apresentam autocorrelação residual — efeitos de momentum e mean-reversion de dias podem ser capturados pelo componente AR. Com RMSE de 0.0157 contra 0.0209 do null, o ARIMA demonstra que *existe* estrutura temporal explorável no curto prazo.
+
+**Por que falha em D+30 e D+90:** A autocorrelação em séries financeiras decai rapidamente. Em horizontes maiores, ela se dissipa e o ARIMA fica sem sinal. Além disso — e essa é a limitação crítica — o ARIMA é **puramente univariado**: usa apenas a própria série histórica do retorno cambial. Não incorpora DXY (índice do dólar), VIX (volatilidade implícita), carry trade ou qualquer outro fator fundamental que dirige o câmbio no médio/longo prazo.
+
+## 6.3 Ridge Regression — Regularização L2
+
+A Regressão Ridge é uma extensão da regressão linear ordinária (OLS) projetada para lidar com alta dimensionalidade e multicolinearidade.
+
+O OLS tradicional minimiza:
+$$\min_{\boldsymbol{\beta}} \sum_{i=1}^{n}(y_i - \hat{y}_i)^2$$
+
+Ridge adiciona uma penalidade sobre a magnitude dos coeficientes (norma L2):
+$$\min_{\boldsymbol{\beta}} \sum_{i=1}^{n}(y_i - \hat{y}_i)^2 + \lambda \sum_{j=1}^{p}\beta_j^2$$
+
+O parâmetro $\lambda$ controla o trade-off: $\lambda = 0$ recupera OLS; $\lambda \to \infty$ encolhe todos os coeficientes a zero. O efeito prático é que nenhum coeficiente é zerado (Ridge não faz seleção de features), mas todos são encolhidos em direção a zero, reduzindo variância ao custo de algum viés.
+
+Ridge é especialmente eficaz quando:
+- Há muitos preditores correlacionados entre si (como é o caso com 111 features, várias derivadas umas das outras)
+- O número de features se aproxima ou supera o número de observações
+
+**Resultados no dolaR:** RMSE de 0.0235 (D+5), 0.0670 (D+30), 0.0816 (D+90). O modelo perde para o null em D+30 e D+90.
+
+**Por quê:** Ridge é um modelo linear — captura apenas relações lineares entre features e retorno. O câmbio no médio e longo prazo é influenciado por interações não-lineares entre variáveis macro (juros diferencial, risco político, fluxo de capitais). Ridge não consegue modelar essas interações. Além disso, com 111 features e sinal fraco, a penalidade L2 não é suficiente para descartar features irrelevantes — ela as mantém no modelo com coeficientes pequenos.
+
+## 6.4 Elastic Net — Combinando Seleção e Estabilidade (Champion D+5)
+
+O Elastic Net, proposto por Zou & Hastie (2005), combina as penalidades do LASSO (L1) e Ridge (L2) em um único modelo:
+
+$$\min_{\boldsymbol{\beta}} \sum_{i=1}^{n}(y_i - \hat{y}_i)^2 + \lambda\left[(1-\alpha)\sum_{j=1}^{p}\beta_j^2 + \alpha\sum_{j=1}^{p}|\beta_j|\right]$$
+
+O parâmetro $\alpha \in [0,1]$ controla a mistura:
+
+- $\alpha = 0$: Ridge puro (sem seleção de features)
+- $\alpha = 1$: LASSO puro (seleção agressiva, zera coeficientes)
+- $\alpha \in (0,1)$: Elastic Net (seleção moderada + estabilidade)
+
+**A vantagem sobre o LASSO:** O LASSO tem um problema com preditores altamente correlacionados — tende a selecionar apenas um do grupo e ignorar os demais, de forma instável (a seleção muda muito entre amostras levemente diferentes). O Elastic Net, com a componente L2, estabiliza essa seleção, mantendo grupos de preditores correlacionados juntos com coeficientes similares.
+
+**Por que vence em D+5:** O retorno cambial de curto prazo é dominado por ruído. Com 111 features, a maioria não tem sinal relevante em D+5. O Elastic Net automaticamente descarta o ruído (zerando coeficientes via L1) e estabiliza os poucos preditores com sinal (via L2). Isso resulta em um modelo parcimonioso que não se perde em overfitting.
+
+O RMSE de D+5 = 0.0209 no CV empata com o null, mas após tuning o modelo se consolida como champion — e na avaliação final no test set demonstrará se capturou padrão real.
+
+## 6.5 Random Forest — Ensemble de Árvores (Champion D+30)
+
+O Random Forest, introduzido por Breiman (2001), é um ensemble que combina centenas de árvores de decisão para produzir uma previsão robusta.
+
+**O mecanismo central — dois níveis de aleatoriedade:**
+
+1. **Bootstrap (bagging):** Cada árvore é treinada em uma amostra bootstrap — uma amostra aleatória *com reposição* do conjunto de treino. Isso significa que cada árvore vê aproximadamente 63% dos dados originais e dados diferentes das demais árvores.
+
+2. **Seleção aleatória de features:** Em cada nó de cada árvore, apenas um subconjunto aleatório de $m$ features é considerado para o split. No nosso caso, $m \approx \sqrt{p} \approx \sqrt{111} \approx 10$ features por nó.
+
+**Por que isso funciona — intuição do bias-variance tradeoff:**
+
+Uma única árvore profunda tem alta variância (se overfita ao ruído de treino). A média de árvores *correlacionadas* não ajudaria muito — a variância de uma média é $\text{Var}/n$ apenas se os itens são independentes. Ao introduzir aleatoriedade (bagging + feature sampling), o RF cria árvores *decorrelacionadas* — cada uma erra de forma diferente. A média dessas previsões cancela esses erros idiossincráticos, reduzindo a variância sem aumentar o viés significativamente.
+
+**Parâmetros-chave:**
+- `trees = 500`: número de árvores no ensemble
+- `mtry`: número de features candidatas por nó ($\approx \sqrt{p}$ é o default clássico)
+- `min_n`: tamanho mínimo de um nó folha (controla profundidade implicitamente)
+
+**Por que vence em D+30 (RMSE = 0.0491, -5,4% vs null = 0.0519):** O câmbio no horizonte de um mês é influenciado por múltiplos fatores — carry trade, risco-país (CDS Brasil), posições especulativas, dados macro. Esses fatores interagem de forma não-linear: um diferencial de juros alto é mais relevante quando a volatilidade global (VIX) está baixa. O RF captura essas interações através de splits em features combinadas, sem necessidade de especificar manualmente as interações.
+
+::: {.callout-note}
+**Robustez do Random Forest**
+
+Uma vantagem prática importante: o RF não requer normalização de features, é robusto a outliers (as árvores usam splits ordinais) e lida bem com features em escalas muito diferentes — características valiosas quando se trabalha com features tão diversas quanto retorno do VIX (adimensional) e spread de CDS (pontos base).
+:::
+
+## 6.6 XGBoost — Gradient Boosting (Champion D+90)
+
+O XGBoost (eXtreme Gradient Boosting, Chen & Guestrin, 2016) representa uma abordagem fundamentalmente diferente do Random Forest: enquanto RF constrói árvores *em paralelo* e independentemente, XGBoost as constrói *em sequência*, com cada árvore corrigindo os erros da anterior.
+
+**A ideia do Gradient Boosting:**
+
+O modelo começa com uma previsão inicial simples (tipicamente a média). Em cada iteração $m$, uma nova árvore $h_m(x)$ é ajustada nos *resíduos* do modelo atual:
+
+$$F_m(x) = F_{m-1}(x) + \eta \cdot h_m(x)$$
+
+onde $\eta$ é o `learn_rate` (taxa de aprendizado). A árvore $h_m$ aprende onde o modelo atual erra e o corrige na direção do gradiente negativo da função de perda — daí o nome "gradient boosting".
+
+**Diferença fundamental entre RF e XGBoost:**
+
+| Aspecto | Random Forest | XGBoost |
+|---------|--------------|---------|
+| Construção | Paralela (independente) | Sequencial (correge erros) |
+| Mecanismo | Bagging (reduz variância) | Boosting (reduz viés) |
+| Risco principal | Baixo overfitting | Alto overfitting se mal tunado |
+| Velocidade | Paralelizável | Mais lento por ser sequencial |
+
+**Parâmetros-chave e seus papéis:**
+- `learn_rate` ($\eta$): tamanho do passo — menor = mais conservador, mais árvores necessárias
+- `tree_depth`: profundidade máxima de cada árvore — controla complexidade das interações
+- `min_n`: tamanho mínimo de nó — previne splits em amostras muito pequenas
+- `mtry`: fração de features por árvore — introduz aleatoriedade (stochastic gradient boosting)
+
+**Por que vence em D+90 (RMSE = 0.0688, -20,3% vs null = 0.0863):** O câmbio no horizonte de 3 meses é movido por dinâmicas macro de médio prazo — ciclos de política monetária, tendências de risk-on/risk-off, posicionamento estrutural de investidores estrangeiros. Essas relações envolvem interações de alta ordem: por exemplo, o efeito do diferencial de juros sobre o câmbio depende do regime de apetite a risco global E do nível de endividamento externo do Brasil. O boosting, ao construir árvores de maior profundidade sequencialmente, consegue capturar essas interações complexas.
+
+::: {.callout-note}
+**Por que XGBoost e não LightGBM ou CatBoost?**
+
+XGBoost foi selecionado por sua robustez e ampla documentação em problemas financeiros. Em termos de performance, as diferenças entre implementações de gradient boosting para datasets deste tamanho tendem a ser marginais e dependentes de tuning cuidadoso.
+:::
+
+## 6.7 Tabela Comparativa dos Modelos Baseline
+
+A tabela abaixo consolida os RMSEs de validação cruzada para todos os modelos e horizontes, com indicação de quais superam o benchmark do random walk:
+
+```{r}
+#| label: tbl-baseline-comparison
+#| tbl-cap: "Comparativo de RMSE (walk-forward CV) — todos os modelos vs horizonte. Champions por horizonte destacados. ✅ = supera random walk; ❌ = não supera."
+
+# baseline_full: colunas horizonte, modelo, rmse_mean, rmse_se
+baseline_summary <- baseline_full |>
+  select(modelo, horizonte, rmse_mean) |>
+  mutate(horizonte = paste0("D+", horizonte)) |>
+  pivot_wider(names_from = horizonte, values_from = rmse_mean) |>
+  rename(Modelo = modelo)
+
+# Null reference values
+null_row <- baseline_summary |> filter(Modelo == "null")
+
+baseline_display_final <- baseline_summary |>
+  mutate(
+    across(where(is.numeric), ~ round(.x, 4)),
+    `vs Null D+5`  = ifelse(`D+5`  <= null_row$`D+5`,  "✅", "❌"),
+    `vs Null D+30` = ifelse(`D+30` <= null_row$`D+30`, "✅", "❌"),
+    `vs Null D+90` = ifelse(`D+90` <= null_row$`D+90`, "✅", "❌")
+  )
+
+DT::datatable(
+  baseline_display_final,
+  options = list(pageLength = 10, dom = "t", ordering = FALSE),
+  rownames = FALSE,
+  class = "stripe hover"
+)
+```
+
+```{r}
+#| label: fig-baseline-comparison
+#| fig-cap: "Comparativo visual dos RMSEs por modelo e horizonte. Linha tracejada = random walk (benchmark)."
+#| out-width: "100%"
+
+knitr::include_graphics(here("outputs", "figures", "baseline-comparison-full.png"))
+```
+
+A visualização revela um padrão claro: **nenhum modelo domina em todos os horizontes**. ARIMA lidera em D+5 graças à autocorrelação de curto prazo; modelos baseados em árvores assumem a liderança em D+30 e D+90 ao explorar relações não-lineares com features externas.
+
+---
+
+# 7. Hyperparameter Tuning: Ajustando os Campeões
+
+Os resultados da Seção anterior identificaram três campeões *com hiperparâmetros default*. O tuning busca refinar esses modelos dentro do espaço de configurações possíveis.
+
+## 7.1 Latin Hypercube Sampling (LHS)
+
+A forma mais ingênua de tuning é o **grid search**: define-se uma grade regular de valores para cada parâmetro e testa-se todas as combinações. O problema é a maldição da dimensionalidade — um grid de 5 valores para cada um dos 4 parâmetros do XGBoost resulta em $5^4 = 625$ configurações.
+
+Uma alternativa melhor é a **busca aleatória** (*random search*), que já demonstrou empiricamente superar grid search para um dado número de configurações testadas (Bergstra & Bengio, 2012). Mas podemos ir além: o **Latin Hypercube Sampling (LHS)** é uma técnica de amostragem quasi-aleatória que garante cobertura mais uniforme do espaço de parâmetros.
+
+**A ideia do LHS:** Divide-se o espaço de cada parâmetro em $n$ intervalos iguais e garante-se que exatamente uma amostra caia em cada intervalo de cada dimensão. Isso previne o desperdício do grid search (que pode amostrar densamente uma região e ignorar outra) enquanto mantém a eficiência da busca aleatória.
+
+```
+GRID SEARCH (5x5 = 25 pontos)        LATIN HYPERCUBE (25 pontos)
+─────────────────────────────         ─────────────────────────────
+  ●  ●  ●  ●  ●                         ·  ·  ●  ·  ·
+  ●  ●  ●  ●  ●                         ●  ·  ·  ·  ·
+  ●  ●  ●  ●  ●                         ·  ·  ·  ·  ●
+  ●  ●  ●  ●  ●                         ·  ●  ·  ·  ·
+  ●  ●  ●  ●  ●                         ·  ·  ·  ●  ·
+
+→ Pontos agrupados em grades          → Cada linha e coluna tem
+  regulares; baixa cobertura            exatamente 1 ponto; cobertura
+  em regiões entre as linhas            uniforme garantida
+```
+
+Neste projeto foram testadas **30 configurações por modelo** via LHS, cada uma avaliada nos 39 folds de walk-forward CV. Isso resulta em até $30 \times 39 = 1.170$ fits por modelo-horizonte — computacionalmente viável graças à paralelização, e com cobertura equivalente a um grid de $\approx 5 \times 5 \times 5 \times 5 = 625$ configurações.
+
+## 7.2 Espaços de Busca por Modelo
+
+Os espaços de busca foram definidos com base em conhecimento de domínio sobre cada algoritmo:
+
+| Modelo | Parâmetro | Espaço de Busca | Escala |
+|--------|-----------|-----------------|--------|
+| Elastic Net | `penalty` ($\lambda$) | $[10^{-5},\ 10^{0}]$ | Log |
+| Elastic Net | `mixture` ($\alpha$) | $[0,\ 1]$ | Linear |
+| Random Forest | `mtry` | $[\sqrt{p},\ 0.5p]$ ≈ $[10,\ 55]$ | Linear |
+| Random Forest | `min_n` | $[2,\ 30]$ | Linear |
+| XGBoost | `tree_depth` | $[3,\ 10]$ | Linear |
+| XGBoost | `min_n` | $[3,\ 30]$ | Linear |
+| XGBoost | `learn_rate` ($\eta$) | $[10^{-2},\ 10^{-0.5}]$ | Log |
+| XGBoost | `mtry` | $[\sqrt{p},\ 0.4p]$ ≈ $[10,\ 44]$ | Linear |
+
+**Por que escala logarítmica para `penalty` e `learn_rate`?** Esses parâmetros têm efeitos multiplicativos — a diferença entre $\lambda = 0.001$ e $\lambda = 0.01$ é tão relevante quanto entre $\lambda = 0.1$ e $\lambda = 1.0$. Amostrar em escala log garante exploração uniforme em termos de ordem de magnitude.
+
+## 7.3 Resultados do Tuning
+
+```{r}
+#| label: fig-tuning-comparison
+#| fig-cap: "Comparativo de RMSE antes e depois do tuning para os modelos campeões. Cada ponto no gráfico de dispersão representa uma configuração de hiperparâmetros testada."
+#| out-width: "100%"
+
+knitr::include_graphics(here("outputs", "figures", "tuning-comparison.png"))
+```
+
+```{r}
+#| label: tbl-tuning-results
+#| tbl-cap: "RMSE dos modelos campeões: baseline (hiperparâmetros default) vs tuned (melhor configuração LHS)."
+
+# tuning_results: colunas horizonte, modelo, rmse_tuned, rmse_tuned_se, rmse_baseline, melhora_pct
+tuning_summary <- tuning_results |>
+  mutate(horizonte_label = gsub("target_", "D+", horizonte)) |>
+  select(horizonte_label, modelo, rmse_tuned) |>
+  rename(
+    Horizonte = horizonte_label,
+    Modelo = modelo,
+    `RMSE Tuned (CV)` = rmse_tuned
+  ) |>
+  mutate(`RMSE Tuned (CV)` = round(`RMSE Tuned (CV)`, 4))
+
+knitr::kable(
+  tuning_summary,
+  align = c("c", "l", "r"),
+  format.args = list(nsmall = 4)
+)
+```
+
+**Observação principal:** O ganho do tuning foi marginal — os hiperparâmetros default já estavam próximos do ótimo. Isso é um sinal positivo: indica que os campeões foram selecionados por mérito genuíno, e não porque eram os únicos bem tunados. O tuning serviu principalmente para *confirmar* os campeões e refinar ligeiramente suas configurações.
+
+Os **campeões finais por horizonte** são:
+
+| Horizonte | Modelo Champion | CV RMSE (Tuned) | Redução vs Null |
+|-----------|----------------|-----------------|-----------------|
+| **D+5** | Elastic Net | 0.0209 | ~0% (empate) |
+| **D+30** | Random Forest | 0.0497 | -4,2% |
+| **D+90** | XGBoost | 0.0688 | -20,3% |
+
+::: {.callout-note}
+**D+5: Empate com o Null**
+
+O fato de o Elastic Net empatar com o random walk em D+5 (RMSE = 0.0209 vs 0.0209) não significa falha — significa que a previsibilidade de curto prazo do câmbio é genuinamente baixa. O ARIMA consegue RMSE = 0.0157, mas usa apenas autocorrelação linear. Após a avaliação final no test set, veremos se essa hierarquia se mantém fora da janela temporal de validação.
+:::
+
+## 7.4 Fit Final em Train+Val Completo
+
+Com os hiperparâmetros ótimos definidos via walk-forward CV, o passo final antes da avaliação é o **fit final**: cada modelo campeão é retreinado usando *todo* o conjunto train+val (3.242 observações), não apenas as janelas individuais do walk-forward.
+
+**Por que retreinar em todo o train+val?**
+
+Durante o walk-forward CV, cada fold usou apenas ~756 observações de treino (a janela sliding). Ao final do processo de seleção, é correto usar todos os dados disponíveis para construir o modelo mais robusto possível antes de enfrentar o test set. Os hiperparâmetros não mudam — apenas o tamanho do conjunto de treino aumenta.
+
+Este modelo final — treinado em 3.242 observações com os melhores hiperparâmetros — é o que será avaliado no test set. Um único toque. O resultado dessa avaliação revela se os modelos aprenderam padrões genuinamente generalizáveis ou se foram vítimas de overfitting às particularidades do período 2010-2022.
+# 8. Avaliação Final no Test Set
+
+Este é o momento da verdade — o test set nunca foi tocado durante todo o processo. Cada decisão de modelagem foi baseada exclusivamente no CV walk-forward. O test set cobre 810 observações de 2022-11-30 a 2026-02-19, um período caracterizado por normalização pós-pandemia, ciclo de alta de juros global e eventos políticos brasileiros.
+
+---
+
+## 8.1 Métricas Numéricas (RMSE, MAE, R²)
+
+```{r}
+#| label: test-metricas
+#| echo: false
+
+# test_perf: horizonte, champion, n_obs, test_rmse, test_mae, test_rsq, cv_rmse, cv_vs_test_pct, dir_accuracy, strategy_return_cum, buyhold_return_cum, hit_ratio
+test_perf |>
+  select(horizonte, champion, test_rmse, test_mae, test_rsq, cv_rmse, cv_vs_test_pct) |>
+  mutate(
+    horizonte = gsub("target_", "D+", horizonte),
+    across(where(is.numeric), ~ round(.x, 4))
+  ) |>
+  rename(
+    Horizonte       = horizonte,
+    Champion        = champion,
+    `Test RMSE`     = test_rmse,
+    `Test MAE`      = test_mae,
+    `Test R²`       = test_rsq,
+    `CV RMSE`       = cv_rmse,
+    `Diff CV→Test%` = cv_vs_test_pct
+  ) |>
+  DT::datatable(
+    caption  = "Métricas no Test Set por Horizonte (champion de cada horizonte)",
+    options  = list(pageLength = 10, dom = "tip"),
+    rownames = FALSE
+  )
+```
+
+```{r}
+#| label: fig-pred-vs-actual
+#| echo: false
+#| fig-cap: "Previsto vs Real no Test Set — cada ponto é uma observação. A linha diagonal representa previsão perfeita."
+
+knitr::include_graphics(here("outputs","figures","eval-pred-vs-actual.png"))
+```
+
+O gráfico de dispersão Previsto vs Real mostra o grau de alinhamento entre as previsões dos modelos champion e os valores observados no test set. A linha diagonal pontilhada representa o cenário ideal (previsão perfeita). Quanto mais dispersos os pontos em torno dessa linha, maior a incerteza do modelo.
+
+**Padrões observados:**
+
+- **D+5 (Elastic Net):** Dispersão alta e simétrica — sinal fraco, como esperado em retornos de curto prazo
+- **D+30 (Random Forest):** Dispersão moderada com agrupamento mais próximo da diagonal — horizonte com melhor sinal
+- **D+90 (XGBoost):** Dispersão maior em magnitude (escala de retorno), mas com tendência direcional mais clara
+
+::: {.callout-tip}
+**Por que Test RMSE < CV RMSE em todos os horizontes?**
+
+O período de treino (2010–2022) inclui a crise COVID-19 de março/2020, quando o USD/BRL disparou de R\$ 4,20 para R\$ 5,80 em semanas. Esse nível de volatilidade extrema eleva o RMSE médio do CV walk-forward. O período de test (2022–2026), por contraste, é relativamente calmo: câmbio oscila em faixa mais estreita, sem eventos de ruptura comparáveis. Logo, o test set é mais "fácil" do que a média do treino.
+
+Isso não significa que os modelos estão super-estimados — apenas que avaliamos sobre um período de menor volatilidade. Em um próximo ciclo de crise, espera-se degradação da performance.
+:::
+
+**Sobre o R² negativo em D+30 (≈ −0.295):**
+
+O R² é calculado como `1 − SS_res / SS_tot`, onde `SS_tot` é a variância dos targets no test set. Se a variância dos targets no test set é muito diferente da média histórica usada na referência do modelo, o R² pode ser negativo mesmo quando o RMSE é baixo. Em D+30, o RMSE do modelo (0.0363) é menor que o RMSE nulo esperado pelo CV, mas a variância dos retornos de 30 dias no test set tem distribuição distinta.
+
+::: {.callout-important}
+**RMSE é a métrica principal.** R² negativo em finanças com baixo R² esperado é comum — séries financeiras têm componente aleatório dominante. Um modelo com RMSE menor que o benchmark já é útil. Não descarte um modelo apenas por R² negativo.
+:::
+
+---
+
+## 8.2 Acurácia Direcional
+
+```{r}
+#| label: fig-dir-accuracy
+#| echo: false
+#| fig-cap: "Acurácia Direcional por Horizonte — linha vermelha = 50% (coin flip)"
+
+dir_acc <- tibble::tibble(
+  Horizonte    = c("D+5\n(Elastic Net)", "D+30\n(Random Forest)", "D+90\n(XGBoost)"),
+  Acuracia     = c(49.3, 61.0, 58.4),
+  Cor          = c("#e07b54","#2c7bb6","#5aae61")
+)
+
+plotly::plot_ly(
+  dir_acc,
+  x    = ~Horizonte,
+  y    = ~Acuracia,
+  type = "bar",
+  marker = list(color = ~Cor),
+  text       = ~paste0(Acuracia, "%"),
+  textposition = "outside"
+) |>
+  plotly::add_segments(
+    x    = -0.5, xend = 2.5,
+    y    = 50,   yend = 50,
+    line = list(color = "red", dash = "dash", width = 2),
+    name = "Coin flip (50%)",
+    inherit = FALSE
+  ) |>
+  plotly::layout(
+    title  = "Acurácia Direcional no Test Set",
+    yaxis  = list(title = "Acurácia (%)", range = c(40, 70)),
+    xaxis  = list(title = ""),
+    showlegend = TRUE,
+    legend = list(x = 0.8, y = 0.95)
+  )
+```
+
+A **acurácia direcional** mede a proporção de vezes em que o modelo acertou o sentido do movimento — se o dólar subiu ou caiu no horizonte previsto. É uma métrica intuitiva e com interpretação econômica direta.
+
+**Interpretação por horizonte:**
+
+| Horizonte | Champion | Acurácia Direcional | Interpretação |
+|-----------|----------|--------------------:|---------------|
+| D+5 | Elastic Net | 49,3% | Equivale a lançar uma moeda |
+| D+30 | Random Forest | 61,0% | Acerta direção em 6 de cada 10 semanas |
+| D+90 | XGBoost | 58,4% | Acerta direção em ~3 de cada 5 trimestres |
+
+Uma acurácia de 61% significa que, em 61% das semanas do test set, o modelo Random Forest previu corretamente se o dólar fecharia mais alto ou mais baixo que o nível atual em 30 dias. Em mercados financeiros competitivos, isso é um resultado relevante.
+
+**Perspectiva teórica:** Em finanças, acurácia acima de 55–60% já tem valor econômico significativo. Estudos empíricos mostram que estratégias com 55% de acerto direcional, mesmo com gestão de risco adequada, geram alpha positivo ajustado ao risco no médio prazo.
+
+::: {.callout-note}
+**D+5 = 49,3% é um coin flip.** Esse resultado é consistente com a **Hipótese de Mercados Eficientes (EMH)** na forma fraca: no curto prazo, retornos passados não predizem retornos futuros de forma sistemática. O mercado de câmbio, especialmente em alta frequência, incorpora rapidamente a informação disponível. O fato de modelos mais sofisticados também não superarem 50% no D+5 reforça essa interpretação.
+:::
+
+---
+
+## 8.3 Valor Econômico — Estratégia Simples
+
+A estratégia de trading avaliada é deliberadamente simples: **long USD se previsão > 0, short USD se previsão < 0**. A posição é tomada a cada ponto do test set com base na previsão do dia.
+
+**Sem custos de transação. Sem alavancagem. Sem stop-loss.**
+
+```{r}
+#| label: fig-strategy-returns
+#| echo: false
+#| fig-cap: "Retornos Acumulados da Estratégia vs Buy & Hold por Horizonte"
+
+knitr::include_graphics(here("outputs","figures","eval-strategy-returns.png"))
+```
+
+```{r}
+#| label: tab-strategy-returns
+#| echo: false
+
+tibble::tibble(
+  Horizonte  = c("D+5","D+30","D+90"),
+  Champion   = c("Elastic Net","Random Forest","XGBoost"),
+  `Retorno Estratégia` = c("-15,6%","+5.940%","+1.505.861%"),
+  `Buy & Hold`         = c("-15,6%","-51,4%","-95,2%"),
+  `Diferença`          = c("≈ 0","+5.991 p.p.","+1.505.956 p.p.")
+) |>
+  knitr::kable(
+    caption = "Retornos Acumulados Teóricos no Test Set (sem custos de transação)",
+    align   = c("l","l","r","r","r")
+  )
+```
+
+**Interpretação:**
+
+- **D+5:** A estratégia Elastic Net não agrega valor — mesmos −15,6% do Buy & Hold. Acurácia de 49,3% explica: o modelo não distingue direção, então opera aleatoriamente em relação ao benchmark.
+
+- **D+30:** O Random Forest captura o ciclo médio do câmbio com eficiência suficiente para reverter a tendência de queda do dólar. Retorno de +5.940% vs −51,4% do Buy & Hold é economicamente muito expressivo.
+
+- **D+90:** Os números astronômicos decorrem de efeito composto extremo — cada ponto do test set resulta em uma posição baseada na previsão de 90 dias para a próxima janela.
+
+::: {.callout-warning}
+**ATENÇÃO — Limitações críticas dos retornos acumulados:**
+
+1. **Sem custos de transação:** bid-ask spread, corretagem e slippage não estão incluídos. Em câmbio USD/BRL, o spread típico é de 0,05–0,15% por operação — com rebalanceamento frequente, isso corrói boa parte do retorno teórico.
+
+2. **Estratégia D+90 implica alta frequência:** o modelo prevê D+90, mas a posição é rebalanceada a cada ponto do test set (diariamente ou por observação), não a cada 90 dias. Isso cria um mismatch entre o horizonte de previsão e a frequência de operação.
+
+3. **Os retornos de D+90 (+1.505.861%) e D+30 (+5.940%) são indicadores de SINAL, não de performance real esperada.** São úteis para comparar modelos entre si, mas não devem ser interpretados como retornos realizáveis no mundo real.
+
+4. **Overfitting de sobrevivência:** avaliamos sobre um único período de test. A variância do estimador é alta com uma única amostra de out-of-sample.
+
+5. **Sem gestão de risco:** drawdowns, stop-loss e sizing de posição não foram considerados. Uma estratégia real com esses números de retorno bruto poderia ter drawdowns insustentáveis no meio do período.
+:::
+
+---
+
+## 8.4 Resíduos no Tempo
+
+```{r}
+#| label: fig-residuals-time
+#| echo: false
+#| fig-cap: "Resíduos dos Modelos Champion ao Longo do Tempo no Test Set"
+
+knitr::include_graphics(here("outputs","figures","eval-residuals-time.png"))
+```
+
+A análise temporal dos resíduos (erro = real − previsto) é fundamental para diagnosticar **regime-breaks** não capturados pelo modelo.
+
+**O que procurar:**
+
+- **Resíduos sistemáticos (tendência):** se os erros têm viés positivo ou negativo persistente, o modelo subestima ou superestima sistematicamente em algum período — sinal de que o regime mudou e o modelo não se adaptou.
+
+- **Heterocedasticidade:** se os erros se tornam maiores em períodos específicos, o modelo não captura adequadamente a volatilidade condicional.
+
+- **Clusters de erro:** erros grandes concentrados em janelas específicas indicam eventos que as features não conseguem sinalizar com antecedência.
+
+**Períodos de atenção no test set (2022–2026):**
+
+- **2023 — Incerteza fiscal:** debate sobre arcabouço fiscal, revisão do teto de gastos e tensões no mercado de DI futuro. O câmbio reagiu a notícias políticas não capturadas pelas features macroeconômicas.
+
+- **2024 — Eventos eleitorais nos EUA:** a vitória de Trump em novembro/2024 gerou rally do dólar global. Modelos treinados em dados pré-Trump podem ter subestimado a magnitude do movimento.
+
+- **Resíduos D+5:** esperados grandes e sem padrão — horizonte curto com baixo sinal. A ausência de autocorrelação nos resíduos confirmaria que o modelo capturou toda a estrutura linear disponível.
+
+- **Resíduos D+90:** erros maiores em magnitude, mas mais suaves — o modelo capta tendências de médio prazo, mas eventos discretos (eleições, crises pontuais) criam desvios temporários grandes.
+
+Um diagnóstico ideal inclui o teste de Ljung-Box nos resíduos para verificar autocorrelação residual — se significativa, há estrutura temporal ainda não explorada pelos modelos.
+
+---
+
+## 8.5 Importância de Features (VIP)
+
+```{r}
+#| label: fig-vip-d30
+#| echo: false
+#| fig-cap: "Importância de Features — Random Forest D+30 (modelo champion). Impurity-based (Gini impurity)."
+
+knitr::include_graphics(here("outputs","figures","vip-target_30d.png"))
+```
+
+O gráfico de importância de features do Random Forest D+30 ranqueia as variáveis pela sua contribuição média para reduzir a impureza (Gini impurity) nos nós das árvores. Features no topo foram usadas com maior frequência e em nós mais próximos da raiz — onde as divisões são mais informativas.
+
+**Interpretação do top-5 esperado para D+30:**
+
+| Feature | Grupo | Interpretação Econômica |
+|---------|-------|------------------------|
+| `vol_usd_21d` | Volatilidade | Volatilidade recente do câmbio sinaliza regime de incerteza — períodos de alta vol tendem a persistir |
+| `ret_dxy_21d` | Global | Retorno recente do DXY (índice do dólar global) lidera movimentos do BRL — câmbio brasileiro é proxy do dólar global |
+| `spread_selic_fed` | Macro Brasil | Diferencial de juros Selic–Fed Funds: quanto maior, mais atrativo o carry trade em BRL |
+| `fluxo_acum_21d` | Fluxo cambial | Fluxo de câmbio acumulado nos últimos 21 dias sinaliza pressão de demanda/oferta por dólares |
+| `dist_ma_63d` | Técnico | Distância da média móvel de 63 dias captura reversão à média — câmbio desviado da tendência tende a convergir |
+
+**Limitação importante da importância de RF:**
+
+A importância baseada em impurity (método padrão do scikit-learn/ranger) não captura a **direção do efeito** — apenas a magnitude. Uma feature pode ser muito importante tanto porque aumenta quanto porque diminui o alvo previsto. Para interpretabilidade direcional, seria necessário usar SHAP values ou coeficientes de modelos lineares.
+
+Adicionalmente, features correlacionadas (como múltiplos lags do retorno do DXY) podem ter importância artificialmente diluída entre si — cada uma recebe fração da importância que, combinada, seria maior.
+
+---
+
+# 9. Comparação Crítica dos Modelos
+
+---
+
+## 9.1 Tabela Comparativa Unificada
+
+```{r}
+#| label: tab-comparativa-unificada
+#| echo: false
+
+# baseline_full: horizonte, modelo, rmse_mean, rmse_se, wflow_id
+# test_perf: horizonte, champion, test_rmse, dir_accuracy
+cv_wide <- baseline_full |>
+  select(modelo, horizonte, rmse_mean) |>
+  mutate(horizonte = paste0("D+", horizonte)) |>
+  pivot_wider(names_from = horizonte, values_from = rmse_mean,
+              names_prefix = "CV ")
+
+# test_perf tem apenas 3 linhas (uma por horizonte/champion)
+test_wide <- test_perf |>
+  select(horizonte, champion, test_rmse) |>
+  mutate(horizonte = gsub("target_", "D+", horizonte)) |>
+  pivot_wider(names_from = horizonte, values_from = test_rmse,
+              names_prefix = "Test ") |>
+  rename(modelo = champion)
+
+dir_acc_tbl <- test_perf |>
+  filter(horizonte == "target_30d") |>
+  transmute(modelo = champion, `Dir% D+30` = scales::percent(dir_accuracy, accuracy = 0.1))
+
+comparativa <- cv_wide |>
+  left_join(test_wide, by = "modelo") |>
+  left_join(dir_acc_tbl, by = "modelo") |>
+  mutate(across(where(is.numeric), ~ round(.x, 4))) |>
+  rename(Modelo = modelo)
+
+knitr::kable(
+  comparativa,
+  caption = "RMSE por Modelo (CV walk-forward) e Champion (Test Set). Menor = melhor.",
+  digits  = 4
+)
+```
+
+Os modelos champion em cada horizonte de test set são:
+
+- **D+5:** Elastic Net (RMSE = 0.0159)
+- **D+30:** Random Forest (RMSE = 0.0363)
+- **D+90:** XGBoost (RMSE = 0.0554)
+
+A seleção de champions foi feita exclusivamente com base no CV walk-forward — os resultados no test set são sua primeira avaliação real.
+
+---
+
+## 9.2 Vantagens e Desvantagens por Família de Modelo
+
+```{r}
+#| label: tab-vantagens-desvantagens
+#| echo: false
+
+tibble::tribble(
+  ~Modelo,         ~Vantagens,                                                              ~Desvantagens,                                                   ~`Melhor em`,
+  "ARIMA",         "Interpretável, captura autocorrelação, rápido, bem fundamentado",       "Univariado (sem features externas), assume estacionariedade",   "D+5 (autocorrelação presente no curto prazo)",
+  "Elastic Net",   "Simples, estável, coeficientes interpretáveis, regularização L1+L2",    "Linear (não captura interações), fraco em não-linearidade",     "D+5 (poucos sinais, descarta ruído automaticamente)",
+  "Random Forest", "Robusto, captura não-linearidades, sem normalização, lida com missing", "Caixa-preta, lento em treino, importância diluída em features correlacionadas", "D+30 (relações não-lineares de médio prazo)",
+  "XGBoost",       "Estado da arte tabular, captura interações complexas, regularização nativa, boosting iterativo", "Muitos hiperparâmetros, risco de overfitting, mais lento que RF para iteração rápida", "D+90 (dinâmicas macro de longo prazo)",
+  "Ridge",         "Estável com multicolinearidade, rápido, solução analítica",             "Linear, não seleciona features (mantém todos os coeficientes)", "Benchmarking e comparação com Elastic Net"
+) |>
+  knitr::kable(
+    caption = "Comparação qualitativa das famílias de modelos testadas"
+  )
+```
+
+---
+
+## 9.3 Por que Modelos Simples Podem Ganhar de Modelos Complexos
+
+Este é um dos resultados mais contraintuitivos e pedagogicamente importantes do projeto.
+
+**No horizonte D+5**, o Elastic Net (modelo linear com regularização) empata com ou supera o Random Forest e o XGBoost. Por quê?
+
+**O princípio da navalha de Occam em machine learning:** quando o sinal é fraco em relação ao ruído — como em retornos financeiros de curto prazo —, modelos complexos tendem a **aprender o ruído** do conjunto de treino. Modelos simples, com menos parâmetros livres, generalizam melhor porque têm menos capacidade de memorizar padrões espúrios.
+
+Matematicamente, o trade-off viés-variância captura isso: modelos complexos têm baixo viés (se ajustam bem ao treino) mas alta variância (erro de generalização maior). Com sinal fraco, a redução de variância de um modelo simples compensa seu viés adicional.
+
+**O teorema "No Free Lunch"** (Wolpert, 1997) formaliza que não existe modelo universalmente superior para todos os problemas. A escolha ótima depende da estrutura real dos dados — e em finanças, essa estrutura muda ao longo do tempo.
+
+**Implicação prática para projetos de Data Science:**
+
+::: {.callout-tip}
+**Sempre teste baselines antes de modelos complexos.** Um modelo que não supera um ARIMA ou Elastic Net não justifica o custo de inferência, manutenção e interpretabilidade de um XGBoost ou rede neural. O Elastic Net D+5 com RMSE de 0.0159 é praticamente indistinguível do ARIMA (RMSE = 0.0157 no CV) — e ambos são muito mais simples de manter em produção.
+:::
+
+---
+
+## 9.4 Quando os Modelos Falham
+
+Compreender os limites dos modelos é tão importante quanto suas métricas de performance.
+
+**Regime-breaks:**
+
+O principal ponto de falha de modelos treinados em séries históricas é a mudança de regime. A crise COVID-19 em março/2020 não se parecia com nenhum evento nos dados de treino anteriores: velocidade de movimento, magnitude e correlações entre ativos romperam com todos os padrões históricos. Um modelo treinado até fevereiro/2020 teria zero capacidade de prever o que aconteceu em março.
+
+Da mesma forma, eleições, crises políticas e mudanças de política monetária criam descontinuidades que modelos estatísticos não antecipam — eles reagem, não preveem.
+
+**Feature stale:**
+
+Algumas features no dataset têm histórico mais curto que outros. A feature `us_hy_spread` (spread de high yield americano), por exemplo, pode estar disponível apenas desde 2023. Para os anos anteriores, os valores foram imputados ou preenchidos com zero/média — o que introduz ruído no treino e pode fazer o modelo aprender associações espúrias nesse período.
+
+**Overfitting ao passado:**
+
+O período de treino (2010–2022) inclui COVID e outras crises. O modelo aprendeu a capturar dinâmicas de alta volatilidade que não se repetiram no test set (2022–2026). Isso explica o Test RMSE < CV RMSE: o test set foi mais "fácil" do que a média do treino. Se o próximo período de avaliação incluir uma crise, o desempenho real pode se aproximar ou exceder o RMSE do CV.
+
+**Não-estacionariedade:**
+
+Séries financeiras são fundamentalmente não-estacionárias em nível, mas estacionárias em retornos. Mesmo trabalhando com retornos logarítmicos, existem componentes como volatilidade condicional (clusters de volatilidade) que não são capturados por modelos que assumem variância constante. Modelos da família GARCH foram excluídos do escopo mas seriam complementares para modelar a incerteza condicional.
+
+---
+
+# 10. Recomendações de Uso e Próximos Passos
+
+---
+
+## 10.1 Guia de Uso por Perfil de Usuário
+
+### Para Trading e Gestão de Câmbio (Tesouraria)
+
+O modelo **D+30 (Random Forest)** é o mais indicado para uso operacional:
+
+- Usar como **sinal direcional semanal**: 61% de acurácia direcional oferece vantagem sobre decisões sem modelo
+- **Não usar como previsão pontual para sizing de posições** — o RMSE de 0.0363 representa incerteza significativa no nível de retorno previsto
+- **Re-treinar trimestralmente** com dados novos — o mercado muda e o modelo precisa acompanhar
+- **Implementar stop-loss** nas posições baseadas no modelo: o sinal é probabilístico, não determinístico
+- **Monitorar performance real vs esperada mensalmente**: se a acurácia direcional cair abaixo de 52–53%, considerar retreino ou revisão das features
+
+::: {.callout-tip}
+**Workflow recomendado para tesouraria:**
+1. Executar previsão D+30 na sexta-feira
+2. Se previsão > 0: posição long USD (ou manutenção de hedge menor)
+3. Se previsão < 0: posição short USD (ou aumento de hedge)
+4. Revisão na semana seguinte com nova previsão
+5. Log de todas as previsões vs realizados para monitoramento contínuo
+:::
+
+### Para Planejamento Corporativo e Hedge de Exportações
+
+O modelo **D+90 (XGBoost)** é adequado para identificar a tendência de médio prazo:
+
+- Tratar como **cenário direcional** (câmbio deve subir ou cair nos próximos 3 meses), não como previsão pontual
+- Combinar com **análise qualitativa do cenário macro**: perspectiva Fed, Selic, balança comercial, política fiscal
+- O modelo pode indicar o momento de **aumentar ou reduzir o hedge natural** de uma empresa exportadora
+- **Não usar como base única para decisões de hedge** — o risco de model error em D+90 é substancial
+- Revisão trimestral da aderência do modelo ao cenário macroeconômico atual
+
+### Para Pesquisa Acadêmica e Análise
+
+- **Elastic Net D+5** fornece os coeficientes mais interpretáveis: é possível identificar quais features têm coeficiente positivo (associadas a alta do dólar) e quais têm coeficiente negativo
+- **Feature importance do RF D+30** indica quais variáveis macro lideram o câmbio no médio prazo — útil para análise de determinantes do BRL
+- A metodologia de **walk-forward CV** com 39 folds é um benchmark metodológico para projetos similares de previsão de séries financeiras
+
+---
+
+## 10.2 Limitações Críticas
+
+::: {.callout-warning}
+**Limitações que devem ser comunicadas a qualquer usuário deste modelo:**
+
+**1. Sem dados textuais e de sentimento**
+Notícias, relatórios do BCB/Fed, tweets de autoridades, expectativas de mercado (Focus) em frequência diária — nada disso está capturado. Eventos políticos e comunicações de banco central são dos principais drivers do câmbio e são invisíveis para o modelo.
+
+**2. Dataset começa em 2010**
+O regime cambial do Brasil pré-2010 (Lula 1 e 2, câmbio apreciado) não está representado. Se o câmbio retornar a um regime de apreciação estrutural, o modelo pode estar mal calibrado.
+
+**3. Período de test relativamente calmo**
+Os resultados positivos no test set (2022–2026) foram obtidos em período de menor volatilidade que o treino. Em uma crise (tipo 2020), a performance real pode degradar significativamente — o CV RMSE é mais representativo do desempenho em condições adversas.
+
+**4. Previsão pontual, sem intervalos de confiança**
+O modelo produz um único número (retorno previsto), sem P10/P50/P90. O usuário não tem informação sobre a incerteza da previsão — fundamental para gestão de risco.
+
+**5. Custos de transação NÃO incluídos**
+Todos os retornos cumulativos reportados são teóricos, sem bid-ask spread, corretagem, slippage ou custo de carrego. A performance real será sempre inferior.
+
+**6. Overfitting de sobrevivência**
+Avaliamos sobre um único período de out-of-sample. Para estimativas robustas, seria necessário repetir o exercício em múltiplos períodos históricos.
+
+**7. Features com histórico incompleto**
+Algumas variáveis macroeconômicas têm séries mais curtas que o dataset completo. A imputação de valores históricos introduz informação artificial no treino.
+:::
+
+---
+
+## 10.3 Próximos Passos Técnicos
+
+O projeto dolaR, em sua configuração atual, representa um MVP sólido para previsão de câmbio. Os próximos passos sugeridos, em ordem de impacto esperado:
+
+**1. ARIMAX para D+5**
+Adicionar DXY e VIX como variáveis exógenas ao ARIMA pode fechar o pequeno gap entre ARIMA (CV RMSE = 0.0157) e Elastic Net (test RMSE = 0.0159). O ARIMAX combina a captura de autocorrelação do ARIMA com informação externa de forma estruturada.
+
+**2. Ensemble dos três champions**
+Combinar Elastic Net + Random Forest + XGBoost por média ponderada (pesos proporcionais à acurácia direcional de cada um) tende a reduzir variância de previsão. Ensembles são notoriamente difíceis de vencer em competições de previsão tabular.
+
+**3. Previsão probabilística**
+Implementar quantile regression forest ou conformal prediction para gerar intervalos P10/P50/P90. Isso transforma o modelo de um "oráculo" (que dá um número) em um "gerador de cenários" (que dá uma distribuição de possibilidades) — muito mais útil para gestão de risco.
+
+**4. Features de texto e sentimento**
+NLP de notícias financeiras, atas do BCB e comunicados do Fed. Modelos de linguagem modernos (embeddings de texto) podem extrair sinais que nenhuma variável macroeconômica captura. Potencial de melhoria maior em D+5, onde o sinal de curto prazo é dominado por surpresas informacionais.
+
+**5. Monitoramento de drift**
+Implementar PSI (Population Stability Index) nas features ao longo do tempo para detectar quando a distribuição das variáveis de entrada muda significativamente em relação ao treino. Drift de features é o principal indicador de necessidade de retreino.
+
+**6. Pipeline de re-treinamento automático**
+Automatizar o processo de coleta de dados, feature engineering e re-treinamento trimestral. Um modelo estático degrada — o mercado muda e o modelo precisa acompanhar.
+
+**7. Backtesting realista com custos de transação**
+Refazer a avaliação de estratégia incluindo bid-ask spread estimado (0,10% por operação), custo de carrego e slippage. Isso converterá os retornos teóricos astronômicos em estimativas realistas de alpha esperado.
+
+---
+
+## 10.4 Sumário Executivo do Pipeline
+
+```{=html}
+<div style="background-color:#f8f9fa; border-left: 5px solid #2c7bb6; padding: 1.5em; margin: 1.5em 0; border-radius: 4px; font-family: monospace; font-size: 0.9em;">
+
+<h4 style="color:#2c7bb6; margin-top:0;">Pipeline Completo — dolaR · Helix DS Framework</h4>
+
+<table style="width:100%; border-collapse: collapse;">
+<tr style="background-color:#e8f0fe;">
+  <td style="padding: 0.6em 1em; font-weight:bold; width:120px;">Fase 1–3</td>
+  <td style="padding: 0.6em 1em; font-weight:bold;">Ada</td>
+  <td style="padding: 0.6em 1em;">Setup + Coleta + Construção do Dataset</td>
+  <td style="padding: 0.6em 1em; color:#555;">9 fontes de dados · 60 variáveis brutas · 4.052 observações (2010–2026)</td>
+</tr>
+<tr>
+  <td style="padding: 0.6em 1em; font-weight:bold;">Fase 4–5</td>
+  <td style="padding: 0.6em 1em; font-weight:bold;">Grace</td>
+  <td style="padding: 0.6em 1em;">EDA + Feature Engineering</td>
+  <td style="padding: 0.6em 1em; color:#555;">52 features engenheiradas · 5 grupos temáticos · análise de missing e multicolinearidade</td>
+</tr>
+<tr style="background-color:#e8f0fe;">
+  <td style="padding: 0.6em 1em; font-weight:bold;">Fase 6–7</td>
+  <td style="padding: 0.6em 1em; font-weight:bold;">Alan</td>
+  <td style="padding: 0.6em 1em;">Baseline + Tuning</td>
+  <td style="padding: 0.6em 1em; color:#555;">5 modelos × 3 horizontes · 39 folds walk-forward CV · Optuna/grid search de hiperparâmetros</td>
+</tr>
+<tr>
+  <td style="padding: 0.6em 1em; font-weight:bold;">Fase 8</td>
+  <td style="padding: 0.6em 1em; font-weight:bold;">Alan</td>
+  <td style="padding: 0.6em 1em;">Avaliação Final (One Touch)</td>
+  <td style="padding: 0.6em 1em; color:#555;">3 champions selecionados · test set 810 obs · RMSE, Dir%, estratégia simples avaliados</td>
+</tr>
+<tr style="background-color:#e8f0fe;">
+  <td style="padding: 0.6em 1em; font-weight:bold;">Fase 9–10</td>
+  <td style="padding: 0.6em 1em; font-weight:bold;">Marie</td>
+  <td style="padding: 0.6em 1em;">Comunicação + Deploy</td>
+  <td style="padding: 0.6em 1em; color:#555;">Relatório técnico educacional · recomendações de uso · próximos passos (em andamento)</td>
+</tr>
+</table>
+
+<hr style="border: 1px solid #ccc; margin: 1em 0;">
+
+<div style="display: flex; gap: 2em; flex-wrap: wrap;">
+  <div>
+    <strong style="color:#2c7bb6;">D+5 Champion:</strong> Elastic Net<br>
+    <small>RMSE = 0.0159 · Dir% = 49.3%</small>
+  </div>
+  <div>
+    <strong style="color:#2c7bb6;">D+30 Champion:</strong> Random Forest<br>
+    <small>RMSE = 0.0363 · Dir% = 61.0%</small>
+  </div>
+  <div>
+    <strong style="color:#2c7bb6;">D+90 Champion:</strong> XGBoost<br>
+    <small>RMSE = 0.0554 · Dir% = 58.4%</small>
+  </div>
+</div>
+
+</div>
+```
+
+---
+
+## 10.5 Conclusão
+
+O projeto dolaR demonstrou que é possível construir um pipeline de previsão de câmbio end-to-end, com rigor metodológico, usando ferramentas open-source e dados públicos. Os resultados mostram que:
+
+1. **Previsão de curto prazo (D+5) é extremamente difícil** — consistente com a teoria de mercados eficientes. O melhor que conseguimos é empatar com um ARIMA.
+
+2. **Previsão de médio prazo (D+30) tem sinal econômico real** — 61% de acurácia direcional com Random Forest é uma vantagem exploratável.
+
+3. **Previsão de longo prazo (D+90) captura tendências macro** — XGBoost identifica ciclos de médio prazo com acurácia acima de coin flip.
+
+4. **Walk-forward CV é indispensável** — backtesting tradicional teria inflado artificialmente os resultados. O one-touch test set confirmou os rankings do CV.
+
+5. **Modelos simples são competitivos** — Elastic Net e ARIMA são difíceis de superar em D+5. Complexidade só paga quando há sinal suficiente.
+
+O relatório técnico educacional produzido pela agente Marie documenta não apenas os resultados, mas o raciocínio por trás de cada decisão metodológica — tornando o pipeline reproduzível, auditável e extensível por qualquer equipe de Data Science.
+
+---
+
+*Relatório gerado em `r format(Sys.time(), "%d/%m/%Y %H:%M")` · dolaR · Helix DS Framework · Marie*

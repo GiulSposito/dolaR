@@ -1,0 +1,36 @@
+══════════════════════════════════════════════════════════
+  Baseline Modeling dolaR — Resumo
+══════════════════════════════════════════════════════════
+  Dataset train+val : 3242 obs
+  Dataset test (hold): 810 obs  [NÃO TOCADO]
+  CV strategy       : sliding_window (39 folds)
+  Modelos testados  : 5 (null, ridge, enet, rf, xgb)
+  Horizontes        : 3 (5d, 30d, 90d)
+
+  Null RMSE (random walk baseline):
+  # A tibble: 3 × 3
+    horizonte  null_rmse horizonte_label
+    <chr>          <dbl> <chr>          
+  1 target_5d     0.0209 5d             
+  2 target_30d    0.0519 30d            
+  3 target_90d    0.0863 90d            
+
+  Candidatos para tuning (Top 2 por horizonte):
+  # A tibble: 6 × 3
+    horizonte  modelo rmse_mean
+    <chr>      <chr>      <dbl>
+  1 target_30d rf        0.0491
+  2 target_30d xgb       0.0543
+  3 target_5d  enet      0.0209
+  4 target_5d  rf        0.0224
+  5 target_90d rf        0.0690
+  6 target_90d xgb       0.0764
+
+  Arquivos gerados:
+  - models/baseline/wfset-target_*.rds
+  - models/test_data.rds
+  - outputs/tables/baseline-cv-results.csv
+  - outputs/figures/baseline-comparison.png
+
+  Próximo passo: scripts/12-tuning.R
+══════════════════════════════════════════════════════════

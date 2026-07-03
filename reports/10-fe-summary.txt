@@ -1,0 +1,19 @@
+══════════════════════════════════════════════════════════
+  Feature Engineering dolaR — Resumo
+══════════════════════════════════════════════════════════
+  Dataset de saída: 4052 obs x 111 vars
+  Features eng. criadas: 52
+
+  Por grupo:
+  G1  Retornos/Momentum    14 features
+  G2  Volatilidade          6 features
+  G3  Spreads Macro        10 features
+  G4  Retornos Externos    16 features
+  G5  Calendário            8 features
+
+  Descartada: saldo_cambial (<14 obs úteis)
+  Atenção: us_hy_spread (cobertura ~2023-07+), pim_geral (gap desde 2022)
+  sofr: NAs antes 2018-04 — avaliar imputação vs remoção
+
+  Próximo passo: scripts/11-modeling.R
+══════════════════════════════════════════════════════════
